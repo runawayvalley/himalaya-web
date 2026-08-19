@@ -61,3 +61,14 @@ Bare keywords search all fields automatically. For targeted queries:
 
 - Python 3.8+
 - [himalaya](https://github.com/pimalaya/himalaya) CLI configured with an email account
+
+## One-command start
+
+Generates a random token, starts the server, and opens a Cloudflare quick tunnel:
+
+```bash
+bash start.sh          # default port 8877
+bash start.sh 9000     # custom port
+```
+
+Prints local + public URLs with the token pre-filled.
