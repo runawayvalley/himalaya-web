@@ -72,3 +72,12 @@ bash start.sh 9000     # custom port
 ```
 
 Prints local + public URLs with the token pre-filled.
+
+## Filter by recipient (catch-all / forwarded mailboxes)
+
+If your mailbox receives forwarded emails for multiple addresses, filter by recipient:
+
+```
+/api/search?token=...&q=to user@example.com
+/api/search?token=...&q=to user@example.com and subject verification
+```

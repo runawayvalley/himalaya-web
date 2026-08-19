@@ -283,10 +283,24 @@ def html_docs(token=""):
 
 <p>Optional: <code>&amp;folder=Sent</code> (default: <code>INBOX</code>), <code>&amp;page=2</code>, <code>&amp;page_size=10</code></p>
 
+<h2>Search DSL</h2>
+<p>Bare keywords search all fields (subject, from, to, body). For targeted queries:</p>
+<table>
+<tr><th>Query</th><th>Filters by</th></tr>
+<tr><td><code>to user@example.com</code></td><td>Recipient — useful for catch-all/forwarded mailboxes</td></tr>
+<tr><td><code>from noreply@service.com</code></td><td>Sender</td></tr>
+<tr><td><code>subject verification</code></td><td>Subject line</td></tr>
+<tr><td><code>body OTP</code></td><td>Body text</td></tr>
+<tr><td><code>date 2026-08-19</code></td><td>Exact date</td></tr>
+<tr><td><code>to user@x.com and subject code</code></td><td>Combine with <code>and</code> / <code>or</code></td></tr>
+</table>
+
 <h2>Find a verification code</h2>
 <div class="note">
 <strong>Step 1:</strong> <a href="/api/search?token={t}&amp;q=verification">/api/search?token=...&amp;q=verification</a> — get latest email ID<br>
-<strong>Step 2:</strong> <code>/api/message/&lt;id&gt;?token=...&amp;body=1</code> — read body, extract code
+<strong>Step 2:</strong> <code>/api/message/&lt;id&gt;?token=...&amp;body=1</code> — read body, extract code<br><br>
+<strong>Filter by recipient</strong> (catch-all / forwarded mailboxes):<br>
+<code>/api/search?token=...&amp;q=to user@example.com and subject verification</code>
 </div>
 
 <h2>Quick start for agents</h2>
