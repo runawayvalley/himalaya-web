@@ -3,7 +3,11 @@
 Himalaya Web — read-only email viewer for browser agents.
 
 Usage:
-    python3 himalaya_web.py [--port 8877] [--token <token>] [--bind 0.0.0.0]
+    python3 himalaya_web.py [--port 8877] [--bind 0.0.0.0]
+
+Environment variables:
+    HIMALAYA_TOKEN — initial token (auto-generated if not set)
+    HIMALAYA_ADMIN_PASSWORD — password to view/rotate token via /api/token
 
 Endpoints (all read-only):
     GET /                          — HTML inbox view (human/agent friendly)
@@ -15,14 +19,17 @@ Endpoints (all read-only):
     GET /api/search?q=<query>&folder=X — JSON: search in folder
     GET /api/folders               — JSON: list folders
     GET /health                    — 200 OK (no auth needed)
+    GET /api/token?password=...    — view current token (admin only)
+    POST /api/token                — rotate token (admin only)
 
-Auth: pass ?token=<TOKEN> query param, or Authorization: Bearer <TOKEN> header.
+Auth: pass ?token=<TOKEN> query param, or Authorization: Bearer *** header.
 """
 
 import argparse
 import html
 import json
 import os
+import secrets
 import subprocess
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -30,6 +37,15 @@ from urllib.parse import urlparse, parse_qs
 
 HIMALAYA = os.environ.get("HIMALAYA_BIN", "himalaya")
 DEFAULT_ACCOUNT = os.environ.get("HIMALAYA_ACCOUNT", "")
+ADMIN_PASSWORD = os.environ.get("HIMALAYA_ADMIN_PASSWORD", "")
+
+# Module-level token state — can be rotated at runtime
+_current_token = None
+
+
+def generate_token():
+    """Generate a secure random token."""
+    return "tok_" + secrets.token_urlsafe(24)
 
 
 def run_himalaya(*args, account=None):
@@ -312,28 +328,151 @@ GET /api/message/176?token={t}
 </body></html>"""
 
 
-class Handler(BaseHTTPRequestHandler):
-    token = None  # set by main()
+def html_token_page():
+    """Token management page — enter password to view/rotate token."""
+    return """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Himalaya Web — Token Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px;
+         display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+          padding: 32px; width: 100%; max-width: 420px; }
+  h1 { margin: 0 0 8px; font-size: 1.3em; }
+  p { color: #8b949e; margin: 0 0 20px; font-size: 0.9em; }
+  label { display: block; margin-bottom: 6px; font-size: 0.85em; color: #8b949e; }
+  input[type=password] { width: 100%; padding: 10px 12px; margin-bottom: 16px;
+    background: #0d1117; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 6px; box-sizing: border-box; font-size: 1em; }
+  input[type=password]:focus { outline: none; border-color: #58a6ff; }
+  .buttons { display: flex; gap: 8px; }
+  button { flex: 1; padding: 10px 16px; border: none; border-radius: 6px;
+           font-size: 0.95em; cursor: pointer; font-weight: 500; }
+  .btn-primary { background: #238636; color: #fff; }
+  .btn-primary:hover { background: #2ea043; }
+  .btn-danger { background: #da3633; color: #fff; }
+  .btn-danger:hover { background: #f85149; }
+  .result { margin-top: 16px; padding: 12px; border-radius: 6px; font-size: 0.9em;
+            display: none; word-break: break-all; }
+  .result.success { display: block; background: #1b4332; border: 1px solid #2ea043; color: #56d364; }
+  .result.error { display: block; background: #3d1f1f; border: 1px solid #f85149; color: #f85149; }
+  .token-display { font-family: monospace; font-size: 0.85em; margin-top: 8px;
+                   padding: 8px; background: #0d1117; border-radius: 4px; cursor: pointer; }
+  .token-display:hover { background: #21262d; }
+  .hint { font-size: 0.8em; color: #8b949e; margin-top: 4px; }
+</style>
+</head><body>
+<div class="card">
+  <h1>🔑 Token Management</h1>
+  <p>Enter admin password to view or rotate the API token.</p>
 
+  <label for="password">Admin Password</label>
+  <input type="password" id="password" placeholder="Enter admin password..." autofocus>
+
+  <div class="buttons">
+    <button class="btn-primary" onclick="viewToken()">View Token</button>
+    <button class="btn-danger" onclick="rotateToken()">Rotate Token</button>
+  </div>
+
+  <div id="result" class="result"></div>
+</div>
+
+<script>
+async function viewToken() {
+  const pw = document.getElementById('password').value;
+  const res = document.getElementById('result');
+  try {
+    const r = await fetch('/api/token?password=' + encodeURIComponent(pw));
+    const data = await r.json();
+    if (r.ok) {
+      res.className = 'result success';
+      res.innerHTML = 'Current token:<div class="token-display" onclick="copyToken(this)" title="Click to copy">' + data.token + '</div><div class="hint">Click token to copy</div>';
+    } else {
+      res.className = 'result error';
+      res.textContent = data.error || 'Failed to get token';
+    }
+  } catch (e) {
+    res.className = 'result error';
+    res.textContent = 'Request failed: ' + e.message;
+  }
+}
+
+async function rotateToken() {
+  const pw = document.getElementById('password').value;
+  const res = document.getElementById('result');
+  if (!confirm('Rotate token? The old token will stop working immediately.')) return;
+  try {
+    const r = await fetch('/api/token?password=' + encodeURIComponent(pw), { method: 'POST' });
+    const data = await r.json();
+    if (r.ok) {
+      res.className = 'result success';
+      res.innerHTML = 'New token (old one revoked):<div class="token-display" onclick="copyToken(this)" title="Click to copy">' + data.token + '</div><div class="hint">Click token to copy</div>';
+    } else {
+      res.className = 'result error';
+      res.textContent = data.error || 'Failed to rotate token';
+    }
+  } catch (e) {
+    res.className = 'result error';
+    res.textContent = 'Request failed: ' + e.message;
+  }
+}
+
+function copyToken(el) {
+  navigator.clipboard.writeText(el.textContent);
+  el.style.background = '#2ea043';
+  setTimeout(() => el.style.background = '', 500);
+}
+
+document.getElementById('password').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') viewToken();
+});
+</script>
+</body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Quiet logs
         pass
 
     def check_auth(self):
-        if not self.token:
+        if not _current_token:
             return True  # no token configured = open access (local only)
 
         # Check Authorization header
         auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:] == self.token:
+        if auth.startswith("Bearer ") and auth[7:] == _current_token:
             return True
 
         # Check query param
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
-        if qs.get("token", [None])[0] == self.token:
+        if qs.get("token", [None])[0] == _current_token:
             return True
 
+        return False
+
+    def check_admin_password(self, qs):
+        """Check if the request has the correct admin password."""
+        if not ADMIN_PASSWORD:
+            return False
+        # Check query param
+        pw = qs.get("password", [None])[0]
+        if pw == ADMIN_PASSWORD:
+            return True
+        # Check JSON body for POST
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > 0:
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body)
+                if data.get("password") == ADMIN_PASSWORD:
+                    return True
+            except json.JSONDecodeError:
+                pass
         return False
 
     def send_json(self, data, status=200):
@@ -362,9 +501,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"status": "ok"})
             return
 
+        # Token management endpoint — requires admin password, NOT token auth
+        if path == "/api/token":
+            if not self.check_admin_password(qs):
+                self.send_json({"error": "Unauthorized. Supply ?password=... matching HIMALAYA_ADMIN_PASSWORD."}, 401)
+                return
+            self.send_json({"token": _current_token})
+            return
+
+        # Token management webpage — no auth needed (password entered in page)
+        if path == "/token":
+            self.send_html(html_token_page())
+            return
+
         # Auth check
         if not self.check_auth():
-            self.send_json({"error": "Unauthorized. Pass ?token=... or Authorization: Bearer ..."}, 401)
+            self.send_json({"error": "Unauthorized. Pass ?token=... or Authorization: Bearer ***"}, 401)
             return
 
         folder = qs.get("folder", ["INBOX"])[0]
@@ -372,11 +524,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/":
             q = qs.get("q", [""])[0]
-            tok = qs.get("token", [""])[0] or (self.token or "")
+            tok = qs.get("token", [""])[0] or (_current_token or "")
             self.send_html(html_inbox(folder, page, query=q, token=tok))
 
         elif path == "/api":
-            tok = qs.get("token", [""])[0] or (self.token or "")
+            tok = qs.get("token", [""])[0] or (_current_token or "")
             self.send_html(html_docs(token=tok))
 
         elif path == "/api/envelopes":
@@ -388,7 +540,7 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path.startswith("/api/message/"):
             msg_id = path.split("/")[-1]
-            tok = qs.get("token", [""])[0] or (self.token or "")
+            tok = qs.get("token", [""])[0] or (_current_token or "")
             as_json = qs.get("format", [""])[0].lower() == "json"
             body_only = qs.get("body", [""])[0] == "1"
             data, err = get_message(msg_id, folder=folder, as_json=as_json, body_only=body_only)
@@ -426,23 +578,41 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_json({"error": "Not found"}, 404)
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        qs = parse_qs(parsed.query)
+
+        # Token rotation endpoint
+        if path == "/api/token":
+            if not self.check_admin_password(qs):
+                self.send_json({"error": "Unauthorized. Supply password matching HIMALAYA_ADMIN_PASSWORD."}, 401)
+                return
+            global _current_token
+            _current_token = generate_token()
+            self.send_json({"token": _current_token})
+            return
+
+        self.send_json({"error": "Not found"}, 404)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Himalaya Web — read-only email viewer")
     parser.add_argument("--port", type=int, default=8877, help="Port to listen on")
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address (use 0.0.0.0 for external)")
-    parser.add_argument("--token", default="", help="Auth token (empty = no auth, local only)")
     args = parser.parse_args()
 
-    Handler.token = args.token or None
+    global _current_token
+    _current_token = os.environ.get("HIMALAYA_TOKEN") or generate_token()
 
     server = HTTPServer((args.bind, args.port), Handler)
     print(f"📧 Himalaya Web running on http://{args.bind}:{args.port}")
-    if Handler.token:
-        print(f"   Token auth enabled. URL: http://{args.bind}:{args.port}/?token={Handler.token}")
+    print(f"   Token auth enabled. URL: http://{args.bind}:{args.port}/?token={_current_token}")
+    if ADMIN_PASSWORD:
+        print(f"   Token management: GET/POST /api/token?password=...")
     else:
-        print("   ⚠️  No token set — open access (local use only)")
-    print("   Endpoints: / | /api/envelopes | /api/message/<id> | /api/search?q= | /api/folders")
+        print("   ⚠️  No HIMALAYA_ADMIN_PASSWORD set — /api/token disabled")
+    print("   Endpoints: / | /api/envelopes | /api/message/<id> | /api/search?q= | /api/folders | /api/token")
     print("   Press Ctrl+C to stop.\n")
 
     try:
