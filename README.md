@@ -9,10 +9,12 @@ A lightweight, read-only web interface for [himalaya](https://github.com/pimalay
 - **Auto-generated secure token** — no need to fill token parameter; always cryptographically random
 - **Token rotation** — view and rotate the token at runtime via `/api/token` with admin password
 - **Token management webpage** — `/token` page to enter password and view/rotate token in browser
+- **Base64 config** — supply himalaya config via `HIMALAYA_CONFIG_BASE64` env var (no local config file needed)
 - **Search** — bare keywords search across subject/from/to/body; structured queries supported (`to X`, `from X`, `subject X and body Y`)
 - **Clean message view** — `?body=1` strips headers for easy parsing
 - **JSON opt-in** — `?format=json` for structured message output
 - **Zero dependencies** — Python stdlib only
+- **Docker support** — Dockerfile included for PaaS/self-hosting
 
 ## Quick start
 
@@ -27,6 +29,47 @@ python3 himalaya_web.py --port 8877
 bash start.sh          # default port 8877
 bash start.sh 9000     # custom port
 ```
+
+## Docker
+
+### Build
+
+```bash
+docker build -t himalaya-web .
+```
+
+### Run
+
+```bash
+docker run -p 8877:8877 \
+  -e HIMALAYA_ADMIN_PASSWORD="your-secret-password" \
+  -e HIMALAYA_CONFIG_BASE64="$(cat ~/.config/himalaya/config.toml | base64 -w0)" \
+  himalaya-web
+```
+
+### Docker Compose
+
+```yaml
+services:
+  himalaya-web:
+    build: .
+    ports:
+      - "8877:8877"
+    environment:
+      HIMALAYA_ADMIN_PASSWORD: "your-secret-password"
+      HIMALAYA_CONFIG_BASE64: "base64-encoded-himalaya-config"
+    restart: unless-stopped
+```
+
+### Environment variables
+
+| Variable | Description |
+|---|---|
+| `HIMALAYA_TOKEN` | Initial token (auto-generated if not set) |
+| `HIMALAYA_ADMIN_PASSWORD` | Password to view/rotate token via `/api/token` and `/token` |
+| `HIMALAYA_CONFIG_BASE64` | Base64-encoded himalaya config (uses default config location if not set) |
+| `HIMALAYA_BIN` | Path to himalaya binary (default: `himalaya`) |
+| `HIMALAYA_ACCOUNT` | Default himalaya account to use |
 
 ## Token management
 
@@ -103,12 +146,3 @@ If your mailbox receives forwarded emails for multiple addresses, filter by reci
 /api/search?token=...&q=to user@example.com
 /api/search?token=...&q=to user@example.com and subject verification
 ```
-
-## Environment variables
-
-| Variable | Description |
-|---|---|
-| `HIMALAYA_TOKEN` | Initial token (auto-generated if not set) |
-| `HIMALAYA_ADMIN_PASSWORD` | Password to view/rotate token via `/api/token` and `/token` |
-| `HIMALAYA_BIN` | Path to himalaya binary (default: `himalaya`) |
-| `HIMALAYA_ACCOUNT` | Default himalaya account to use |

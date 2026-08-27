@@ -8,6 +8,7 @@ Usage:
 Environment variables:
     HIMALAYA_TOKEN — initial token (auto-generated if not set)
     HIMALAYA_ADMIN_PASSWORD — password to view/rotate token via /api/token
+    HIMALAYA_CONFIG_BASE64 — base64-encoded himalaya config (uses default config if not set)
 
 Endpoints (all read-only):
     GET /                          — HTML inbox view (human/agent friendly)
@@ -26,12 +27,14 @@ Auth: pass ?token=<TOKEN> query param, or Authorization: Bearer *** header.
 """
 
 import argparse
+import base64
 import html
 import json
 import os
 import secrets
 import subprocess
 import sys
+import tempfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -41,6 +44,25 @@ ADMIN_PASSWORD = os.environ.get("HIMALAYA_ADMIN_PASSWORD", "")
 
 # Module-level token state — can be rotated at runtime
 _current_token = None
+
+
+def setup_config():
+    """Decode base64 config from env and write to temp file if provided."""
+    config_b64 = os.environ.get("HIMALAYA_CONFIG_BASE64")
+    if config_b64:
+        try:
+            config_data = base64.b64decode(config_b64)
+            # Create temp file that persists for process lifetime
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="himalaya_config_", suffix=".toml", delete=False
+            )
+            tmp.write(config_data)
+            tmp.close()
+            os.environ["HIMALAYA_CONFIG"] = tmp.name
+            return tmp.name
+        except Exception as e:
+            print(f"⚠️  Failed to decode HIMALAYA_CONFIG_BASE64: {e}")
+    return None
 
 
 def generate_token():
@@ -602,12 +624,17 @@ def main():
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address (use 0.0.0.0 for external)")
     args = parser.parse_args()
 
+    # Setup config from base64 env if provided
+    config_path = setup_config()
+
     global _current_token
     _current_token = os.environ.get("HIMALAYA_TOKEN") or generate_token()
 
     server = HTTPServer((args.bind, args.port), Handler)
     print(f"📧 Himalaya Web running on http://{args.bind}:{args.port}")
     print(f"   Token auth enabled. URL: http://{args.bind}:{args.port}/?token={_current_token}")
+    if config_path:
+        print(f"   Config: loaded from HIMALAYA_CONFIG_BASE64 ({config_path})")
     if ADMIN_PASSWORD:
         print(f"   Token management: GET/POST /api/token?password=...")
     else:
