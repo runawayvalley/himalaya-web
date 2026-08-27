@@ -15,6 +15,9 @@ RUN curl -sSL "https://github.com/pimalaya/himalaya/releases/download/${HIMALAYA
 WORKDIR /app
 COPY himalaya_web.py .
 
+# Install gunicorn
+RUN pip install --no-cache-dir gunicorn
+
 # Create non-root user
 RUN useradd --create-home appuser
 USER appuser
@@ -23,5 +26,4 @@ EXPOSE 8877
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8877/health || exit 1
 
-ENTRYPOINT ["python3", "himalaya_web.py"]
-CMD ["--bind", "0.0.0.0", "--port", "8877"]
+ENTRYPOINT ["gunicorn", "himalaya_web:app", "--bind", "0.0.0.0:8877", "--workers", "2"]

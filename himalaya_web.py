@@ -3,7 +3,8 @@
 Himalaya Web — read-only email viewer for browser agents.
 
 Usage:
-    python3 himalaya_web.py [--port 8877] [--bind 0.0.0.0]
+    gunicorn himalaya_web:app --bind 127.0.0.1:8877
+    python3 himalaya_web.py  (falls back to stdlib for local use)
 
 Environment variables:
     HIMALAYA_TOKEN — initial token (auto-generated if not set)
@@ -20,8 +21,8 @@ Endpoints (all read-only):
     GET /api/search?q=<query>&folder=X — JSON: search in folder
     GET /api/folders               — JSON: list folders
     GET /health                    — 200 OK (no auth needed)
-    GET /api/token?password=...    — view current token (admin only)
-    POST /api/token                — rotate token (admin only)
+    POST /api/token                — view or rotate token (admin only, JSON body)
+    GET /token                     — token management webpage
 
 Auth: pass ?token=<TOKEN> query param, or Authorization: Bearer *** header.
 """
@@ -35,7 +36,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import time
 from urllib.parse import urlparse, parse_qs
 
 HIMALAYA = os.environ.get("HIMALAYA_BIN", "himalaya")
@@ -44,6 +45,12 @@ ADMIN_PASSWORD = os.environ.get("HIMALAYA_ADMIN_PASSWORD", "")
 
 # Module-level token state — can be rotated at runtime
 _current_token = None
+
+# Rate limiting for auth failures
+_failed_auth = {}
+MAX_AUTH_ATTEMPTS = 5
+AUTH_WINDOW_SECONDS = 300  # 5 minutes
+LOCKOUT_SECONDS = 900  # 15 minutes
 
 
 def setup_config():
@@ -169,8 +176,7 @@ def get_folders():
         return None, f"Failed to parse: {out[:200]}"
 
 
-def json_response(data, status=200):
-    return status, "application/json", json.dumps(data, ensure_ascii=False)
+# ─── HTML templates ──────────────────────────────────────────────────────────
 
 
 def html_inbox(folder="INBOX", page=1, query="", token=""):
@@ -407,7 +413,11 @@ async function viewToken() {
   const pw = document.getElementById('password').value;
   const res = document.getElementById('result');
   try {
-    const r = await fetch('/api/token?password=' + encodeURIComponent(pw));
+    const r = await fetch('/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw, action: 'view' })
+    });
     const data = await r.json();
     if (r.ok) {
       res.className = 'result success';
@@ -427,7 +437,11 @@ async function rotateToken() {
   const res = document.getElementById('result');
   if (!confirm('Rotate token? The old token will stop working immediately.')) return;
   try {
-    const r = await fetch('/api/token?password=' + encodeURIComponent(pw), { method: 'POST' });
+    const r = await fetch('/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw, action: 'rotate' })
+    });
     const data = await r.json();
     if (r.ok) {
       res.className = 'result success';
@@ -455,173 +469,237 @@ document.getElementById('password').addEventListener('keydown', (e) => {
 </body></html>"""
 
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        # Quiet logs
-        pass
+# ─── Rate limiting ───────────────────────────────────────────────────────────
 
-    def check_auth(self):
-        if not _current_token:
-            return True  # no token configured = open access (local only)
 
-        # Check Authorization header
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:] == _current_token:
-            return True
+def _get_client_ip(environ):
+    """Extract client IP from WSGI environ, respecting X-Forwarded-For."""
+    forwarded = environ.get('HTTP_X_FORWARDED_FOR')
+    if forwarded:
+        return forwarded.split(',')[0].strip()
+    return environ.get('REMOTE_ADDR', 'unknown')
 
-        # Check query param
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        if qs.get("token", [None])[0] == _current_token:
-            return True
 
+def _is_rate_limited(ip):
+    """Check if an IP is locked out due to too many failed auth attempts."""
+    now = time.time()
+    record = _failed_auth.get(ip)
+    if not record:
+        return False
+    if record['locked_until'] > now:
+        return True
+    if now - record['first_attempt'] > AUTH_WINDOW_SECONDS:
+        del _failed_auth[ip]
+        return False
+    return False
+
+
+def _record_failed_auth(ip):
+    """Record a failed auth attempt for an IP."""
+    now = time.time()
+    record = _failed_auth.get(ip)
+    if not record or now - record['first_attempt'] > AUTH_WINDOW_SECONDS:
+        _failed_auth[ip] = {
+            'count': 1,
+            'first_attempt': now,
+            'locked_until': 0,
+        }
+    else:
+        record['count'] += 1
+        if record['count'] >= MAX_AUTH_ATTEMPTS:
+            record['locked_until'] = now + LOCKOUT_SECONDS
+
+
+def _reset_auth_attempts(ip):
+    """Reset failed attempts after a successful auth."""
+    _failed_auth.pop(ip, None)
+
+
+# ─── Auth helpers ────────────────────────────────────────────────────────────
+
+
+def check_auth(environ, qs):
+    """
+    Check token auth using timing-safe comparison.
+    Returns (is_valid, failure_type) where failure_type is 'token' or None.
+    """
+    if not _current_token:
+        return True, None  # no token configured = open access
+
+    # Check Authorization header
+    auth = environ.get('HTTP_AUTHORIZATION', '')
+    if auth.startswith('Bearer '):
+        provided = auth[7:]
+        if secrets.compare_digest(provided, _current_token):
+            return True, None
+
+    # Check query param
+    token_param = qs.get('token', [None])[0]
+    if token_param is not None and secrets.compare_digest(token_param, _current_token):
+        return True, None
+
+    return False, 'token'
+
+
+def check_admin_password(body):
+    """
+    Check admin password from JSON body using timing-safe comparison.
+    Password is never accepted from query params.
+    """
+    if not ADMIN_PASSWORD:
+        return False
+    if not body:
+        return False
+    try:
+        data = json.loads(body)
+        pw = data.get('password', '')
+        return secrets.compare_digest(pw, ADMIN_PASSWORD)
+    except json.JSONDecodeError:
         return False
 
-    def check_admin_password(self, qs):
-        """Check if the request has the correct admin password."""
-        if not ADMIN_PASSWORD:
-            return False
-        # Check query param
-        pw = qs.get("password", [None])[0]
-        if pw == ADMIN_PASSWORD:
-            return True
-        # Check JSON body for POST
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length > 0:
-            body = self.rfile.read(content_length)
-            try:
-                data = json.loads(body)
-                if data.get("password") == ADMIN_PASSWORD:
-                    return True
-            except json.JSONDecodeError:
-                pass
-        return False
 
-    def send_json(self, data, status=200):
-        body = json.dumps(data, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+# ─── WSGI application ────────────────────────────────────────────────────────
 
-    def send_html(self, content, status=200):
-        body = content.encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        qs = parse_qs(parsed.query)
+def app(environ, start_response):
+    """WSGI application entry point for gunicorn."""
+    method = environ['REQUEST_METHOD']
+    path = environ['PATH_INFO'].rstrip('/') or '/'
+    qs = parse_qs(environ.get('QUERY_STRING', ''))
+    content_length = int(environ.get('CONTENT_LENGTH', 0))
+    body = environ['wsgi.input'].read(content_length) if content_length else b''
 
-        # Health check — no auth
-        if path == "/health":
-            self.send_json({"status": "ok"})
-            return
+    ip = _get_client_ip(environ)
 
-        # Token management endpoint — requires admin password, NOT token auth
-        if path == "/api/token":
-            if not self.check_admin_password(qs):
-                self.send_json({"error": "Unauthorized. Supply ?password=... matching HIMALAYA_ADMIN_PASSWORD."}, 401)
-                return
-            self.send_json({"token": _current_token})
-            return
+    # Helper to send JSON response
+    def send_json(data, status=200, extra_headers=None):
+        body_out = json.dumps(data, ensure_ascii=False).encode()
+        headers = [('Content-Type', 'application/json; charset=utf-8'),
+                   ('Content-Length', str(len(body_out)))]
+        if extra_headers:
+            headers.extend(extra_headers)
+        start_response(f'{status} _', headers)
+        return [body_out]
 
-        # Token management webpage — no auth needed (password entered in page)
-        if path == "/token":
-            self.send_html(html_token_page())
-            return
+    def send_html(content, status=200):
+        body_out = content.encode()
+        headers = [('Content-Type', 'text/html; charset=utf-8'),
+                   ('Content-Length', str(len(body_out)))]
+        start_response(f'{status} _', headers)
+        return [body_out]
 
-        # Auth check
-        if not self.check_auth():
-            self.send_json({"error": "Unauthorized. Pass ?token=... or Authorization: Bearer ***"}, 401)
-            return
+    # Health check — no auth
+    if path == '/health':
+        return send_json({'status': 'ok'})
 
-        folder = qs.get("folder", ["INBOX"])[0]
-        page = int(qs.get("page", ["1"])[0])
+    # Token management webpage — no auth needed (password entered in page)
+    if path == '/token':
+        return send_html(html_token_page())
 
-        if path == "/":
-            q = qs.get("q", [""])[0]
-            tok = qs.get("token", [""])[0] or (_current_token or "")
-            self.send_html(html_inbox(folder, page, query=q, token=tok))
+    # Token management API — POST only, password in JSON body
+    if path == '/api/token':
+        if method != 'POST':
+            return send_json({'error': 'Method not allowed. Use POST.'}, 405)
 
-        elif path == "/api":
-            tok = qs.get("token", [""])[0] or (_current_token or "")
-            self.send_html(html_docs(token=tok))
+        if _is_rate_limited(ip):
+            retry_after = int(_failed_auth[ip]['locked_until'] - time.time())
+            return send_json(
+                {'error': 'Too many failed attempts. Try again later.'},
+                429,
+                [('Retry-After', str(retry_after))]
+            )
 
-        elif path == "/api/envelopes":
-            data, err = get_envelopes(folder=folder, page=page, page_size=int(qs.get("page_size", ["20"])[0]))
-            if err:
-                self.send_json({"error": err}, 500)
-            else:
-                self.send_json(data)
+        if not check_admin_password(body):
+            _record_failed_auth(ip)
+            return send_json({'error': 'Unauthorized.'}, 401)
 
-        elif path.startswith("/api/message/"):
-            msg_id = path.split("/")[-1]
-            tok = qs.get("token", [""])[0] or (_current_token or "")
-            as_json = qs.get("format", [""])[0].lower() == "json"
-            body_only = qs.get("body", [""])[0] == "1"
-            data, err = get_message(msg_id, folder=folder, as_json=as_json, body_only=body_only)
-            if err:
-                self.send_json({"error": err}, 500)
-            else:
-                if as_json:
-                    self.send_json(json.loads(data))
-                else:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    body = (data or "").encode()
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+        _reset_auth_attempts(ip)
 
-        elif path == "/api/search":
-            q = qs.get("q", [""])[0]
-            if not q:
-                self.send_json({"error": "Missing ?q= parameter"}, 400)
-                return
-            data, err = search_envelopes(q, folder=folder)
-            if err:
-                self.send_json({"error": err}, 500)
-            else:
-                self.send_json(data)
-
-        elif path == "/api/folders":
-            data, err = get_folders()
-            if err:
-                self.send_json({"error": err}, 500)
-            else:
-                self.send_json(data)
-
-        else:
-            self.send_json({"error": "Not found"}, 404)
-
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        qs = parse_qs(parsed.query)
-
-        # Token rotation endpoint
-        if path == "/api/token":
-            if not self.check_admin_password(qs):
-                self.send_json({"error": "Unauthorized. Supply password matching HIMALAYA_ADMIN_PASSWORD."}, 401)
-                return
-            global _current_token
+        global _current_token
+        data = json.loads(body) if body else {}
+        if data.get('action') == 'rotate':
             _current_token = generate_token()
-            self.send_json({"token": _current_token})
-            return
 
-        self.send_json({"error": "Not found"}, 404)
+        return send_json({'token': _current_token})
+
+    # Rate limit check for token-protected routes
+    if _is_rate_limited(ip):
+        retry_after = int(_failed_auth[ip]['locked_until'] - time.time())
+        return send_json(
+            {'error': 'Too many failed attempts. Try again later.'},
+            429,
+            [('Retry-After', str(retry_after))]
+        )
+
+    # Auth check
+    is_valid, failure_type = check_auth(environ, qs)
+    if not is_valid:
+        _record_failed_auth(ip)
+        return send_json({'error': 'Unauthorized. Pass ?token=... or Authorization: Bearer ***'}, 401)
+
+    _reset_auth_attempts(ip)
+
+    folder = qs.get('folder', ['INBOX'])[0]
+    page = int(qs.get('page', ['1'])[0])
+
+    if path == '/':
+        q = qs.get('q', [''])[0]
+        tok = qs.get('token', [''])[0] or (_current_token or '')
+        return send_html(html_inbox(folder, page, query=q, token=tok))
+
+    elif path == '/api':
+        tok = qs.get('token', [''])[0] or (_current_token or '')
+        return send_html(html_docs(token=tok))
+
+    elif path == '/api/envelopes':
+        data, err = get_envelopes(folder=folder, page=page,
+                                   page_size=int(qs.get('page_size', ['20'])[0]))
+        if err:
+            return send_json({'error': err}, 500)
+        return send_json(data)
+
+    elif path.startswith('/api/message/'):
+        msg_id = path.split('/')[-1]
+        tok = qs.get('token', [''])[0] or (_current_token or '')
+        as_json = qs.get('format', [''])[0].lower() == 'json'
+        body_only = qs.get('body', [''])[0] == '1'
+        data, err = get_message(msg_id, folder=folder, as_json=as_json, body_only=body_only)
+        if err:
+            return send_json({'error': err}, 500)
+        if as_json:
+            return send_json(json.loads(data))
+        body_out = (data or '').encode()
+        headers = [('Content-Type', 'text/plain; charset=utf-8'),
+                   ('Content-Length', str(len(body_out)))]
+        start_response('200 _', headers)
+        return [body_out]
+
+    elif path == '/api/search':
+        q = qs.get('q', [''])[0]
+        if not q:
+            return send_json({'error': 'Missing ?q= parameter'}, 400)
+        data, err = search_envelopes(q, folder=folder)
+        if err:
+            return send_json({'error': err}, 500)
+        return send_json(data)
+
+    elif path == '/api/folders':
+        data, err = get_folders()
+        if err:
+            return send_json({'error': err}, 500)
+        return send_json(data)
+
+    return send_json({'error': 'Not found'}, 404)
+
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
 
 
 def main():
     parser = argparse.ArgumentParser(description="Himalaya Web — read-only email viewer")
     parser.add_argument("--port", type=int, default=8877, help="Port to listen on")
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address (use 0.0.0.0 for external)")
+    parser.add_argument("--gunicorn", action="store_true", help="Use gunicorn instead of stdlib server")
     args = parser.parse_args()
 
     # Setup config from base64 env if provided
@@ -630,23 +708,111 @@ def main():
     global _current_token
     _current_token = os.environ.get("HIMALAYA_TOKEN") or generate_token()
 
-    server = HTTPServer((args.bind, args.port), Handler)
-    print(f"📧 Himalaya Web running on http://{args.bind}:{args.port}")
-    print(f"   Token auth enabled. URL: http://{args.bind}:{args.port}/?token={_current_token}")
+    bind_addr = f"{args.bind}:{args.port}"
+    print(f"📧 Himalaya Web running on http://{bind_addr}")
+    print(f"   Token auth enabled. URL: http://{bind_addr}/?token={_current_token}")
     if config_path:
         print(f"   Config: loaded from HIMALAYA_CONFIG_BASE64 ({config_path})")
     if ADMIN_PASSWORD:
-        print(f"   Token management: GET/POST /api/token?password=...")
+        print(f"   Token management: POST /api/token (JSON body)")
     else:
         print("   ⚠️  No HIMALAYA_ADMIN_PASSWORD set — /api/token disabled")
-    print("   Endpoints: / | /api/envelopes | /api/message/<id> | /api/search?q= | /api/folders | /api/token")
+    print("   Endpoints: / | /api/envelopes | /api/message/<id> | /api/search?q= | /api/folders | /api/token | /token")
     print("   Press Ctrl+C to stop.\n")
 
+    if args.gunicorn:
+        # Use gunicorn programmatically
+        from gunicorn.app.base import BaseApplication
+
+        class GunicornApp(BaseApplication):
+            def __init__(self, app, options=None):
+                self.options = options or {}
+                self.application = app
+                super().__init__()
+
+            def load_config(self):
+                for key, value in self.options.items():
+                    if key in self.cfg.settings and value is not None:
+                        self.cfg.set(key.lower(), value)
+
+            def load(self):
+                return self.application
+
+        options = {
+            'bind': bind_addr,
+            'workers': 2,
+            'timeout': 120,
+        }
+        GunicornApp(app, options).run()
+    else:
+        # Fallback to stdlib for local use
+        from http.server import HTTPServer
+
+        class WSGIHandler:
+            """Simple WSGI-to-Bridge for stdlib HTTPServer."""
+            def __init__(self, app):
+                self.app = app
+
+            def __call__(self, environ, start_response):
+                return self.app(environ, start_response)
+
+        server = HTTPServer((args.bind, args.port), self._make_stdlib_handler())
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down.")
+            server.shutdown()
+
+    # This is unreachable but kept for clarity
     try:
-        server.serve_forever()
+        pass
     except KeyboardInterrupt:
         print("\nShutting down.")
-        server.shutdown()
+
+
+def _make_stdlib_handler(self):
+    """Create a BaseHTTPRequestHandler subclass that bridges to the WSGI app."""
+    from http.server import BaseHTTPRequestHandler
+    app_ref = app
+
+    class WSGIBridgeHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self._handle()
+
+        def do_POST(self):
+            self._handle()
+
+        def _handle(self):
+            from io import BytesIO
+            environ = {
+                'REQUEST_METHOD': self.command,
+                'PATH_INFO': self.path.split('?')[0],
+                'QUERY_STRING': self.path.split('?', 1)[1] if '?' in self.path else '',
+                'CONTENT_TYPE': self.headers.get('Content-Type', ''),
+                'CONTENT_LENGTH': self.headers.get('Content-Length', '0'),
+                'HTTP_AUTHORIZATION': self.headers.get('Authorization', ''),
+                'HTTP_X_FORWARDED_FOR': self.headers.get('X-Forwarded-For', ''),
+                'REMOTE_ADDR': self.client_address[0],
+                'SERVER_NAME': self.server.server_name,
+                'SERVER_PORT': str(self.server.server_port),
+                'wsgi.input': BytesIO(self.rfile.read(int(self.headers.get('Content-Length', 0)))),
+                'wsgi.errors': sys.stderr,
+            }
+
+            def start_response(status, headers):
+                self.send_response(int(status.split(' ')[0]))
+                for h, v in headers:
+                    self.send_header(h, v)
+                self.end_headers()
+
+            result = app_ref(environ, start_response)
+            for chunk in result:
+                self.wfile.write(chunk)
+
+        def log_message(self, format, *args):
+            pass
+
+    return WSGIBridgeHandler
 
 
 if __name__ == "__main__":

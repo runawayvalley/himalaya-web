@@ -10,10 +10,12 @@ A lightweight, read-only web interface for [himalaya](https://github.com/pimalay
 - **Token rotation** — view and rotate the token at runtime via `/api/token` with admin password
 - **Token management webpage** — `/token` page to enter password and view/rotate token in browser
 - **Base64 config** — supply himalaya config via `HIMALAYA_CONFIG_BASE64` env var (no local config file needed)
+- **Rate limiting** — 5 failed auth attempts per 5 minutes, 15-minute lockout
+- **Timing-safe auth** — constant-time comparison for token and password
 - **Search** — bare keywords search across subject/from/to/body; structured queries supported (`to X`, `from X`, `subject X and body Y`)
 - **Clean message view** — `?body=1` strips headers for easy parsing
 - **JSON opt-in** — `?format=json` for structured message output
-- **Zero dependencies** — Python stdlib only
+- **Zero dependencies** — Python stdlib only (gunicorn optional for production)
 - **Docker support** — Dockerfile included for PaaS/self-hosting
 
 ## Quick start
@@ -22,7 +24,11 @@ A lightweight, read-only web interface for [himalaya](https://github.com/pimalay
 # Set admin password (enables token management)
 export HIMALAYA_ADMIN_PASSWORD="your-secret-password"
 
-# Run (token auto-generated)
+# Run with gunicorn (recommended for production)
+pip install gunicorn
+gunicorn himalaya_web:app --bind 127.0.0.1:8877
+
+# Or run with stdlib server (local use only)
 python3 himalaya_web.py --port 8877
 
 # Or use the start script
@@ -89,10 +95,14 @@ Enter your admin password to view or rotate the token. The page lets you copy th
 
 ```bash
 # View current token
-curl "http://localhost:8877/api/token?password=your-secret-password"
+curl -X POST "http://localhost:8877/api/token" \
+  -H "Content-Type: application/json" \
+  -d '{"password": "your-secret-password", "action": "view"}'
 
 # Rotate token (generates a new one, old token immediately invalidated)
-curl -X POST "http://localhost:8877/api/token?password=your-secret-password"
+curl -X POST "http://localhost:8877/api/token" \
+  -H "Content-Type: application/json" \
+  -d '{"password": "your-secret-password", "action": "rotate"}'
 ```
 
 This lets you revoke a token you gave to an AI agent — just rotate it and the old one stops working.
@@ -109,8 +119,7 @@ This lets you revoke a token you gave to an AI agent — just rotate it and the 
 | `GET /api/folders` | JSON list of mailboxes |
 | `GET /health` | `{"status":"ok"}` (no auth) |
 | `GET /token` | Token management webpage |
-| `GET /api/token?password=...` | View current token (admin only) |
-| `POST /api/token?password=...` | Rotate token (admin only) |
+| `POST /api/token` | View or rotate token (admin only, JSON body) |
 
 Optional params: `&folder=Sent`, `&page=2`, `&page_size=10`
 
@@ -137,6 +146,7 @@ Bare keywords search all fields automatically. For targeted queries:
 
 - Python 3.8+
 - [himalaya](https://github.com/pimalaya/himalaya) CLI configured with an email account
+- gunicorn (optional, for production deployment)
 
 ## Filter by recipient (catch-all / forwarded mailboxes)
 
