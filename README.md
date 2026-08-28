@@ -10,7 +10,6 @@ A lightweight, read-only web interface for [himalaya](https://github.com/pimalay
 - **Token rotation** — view and rotate the token at runtime via `/api/token` with admin password
 - **Token management webpage** — `/token` page to enter password and view/rotate token in browser
 - **Base64 config** — supply himalaya config via `HIMALAYA_CONFIG_BASE64` env var (no local config file needed)
-- **Rate limiting** — 5 failed auth attempts per 5 minutes, 15-minute lockout
 - **Timing-safe auth** — constant-time comparison for token and password
 - **Search** — bare keywords search across subject/from/to/body; structured queries supported (`to X`, `from X`, `subject X and body Y`)
 - **Clean message view** — `?body=1` strips headers for easy parsing

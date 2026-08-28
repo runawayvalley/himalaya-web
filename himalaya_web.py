@@ -38,7 +38,6 @@ import secrets
 import subprocess
 import sys
 import tempfile
-import time
 from urllib.parse import urlparse, parse_qs
 
 HIMALAYA = os.environ.get("HIMALAYA_BIN", "himalaya")
@@ -57,11 +56,7 @@ CONFIG_PATH = None
 
 _init_done = False
 
-# Rate limiting for auth failures
-_failed_auth = {}
-MAX_AUTH_ATTEMPTS = 5
-AUTH_WINDOW_SECONDS = 300  # 5 minutes
-LOCKOUT_SECONDS = 900  # 15 minutes
+# ─── Config loading ─────────────────────────────────────────────────────────
 
 
 def setup_config():
@@ -564,51 +559,6 @@ document.getElementById('password').addEventListener('keydown', (e) => {
 </body></html>"""
 
 
-# ─── Rate limiting ───────────────────────────────────────────────────────────
-
-
-def _get_client_ip(environ):
-    """Extract client IP from WSGI environ, respecting X-Forwarded-For."""
-    forwarded = environ.get('HTTP_X_FORWARDED_FOR')
-    if forwarded:
-        return forwarded.split(',')[0].strip()
-    return environ.get('REMOTE_ADDR', 'unknown')
-
-
-def _is_rate_limited(ip):
-    """Check if an IP is locked out due to too many failed auth attempts."""
-    now = time.time()
-    record = _failed_auth.get(ip)
-    if not record:
-        return False
-    if record['locked_until'] > now:
-        return True
-    if now - record['first_attempt'] > AUTH_WINDOW_SECONDS:
-        del _failed_auth[ip]
-        return False
-    return False
-
-
-def _record_failed_auth(ip):
-    """Record a failed auth attempt for an IP."""
-    now = time.time()
-    record = _failed_auth.get(ip)
-    if not record or now - record['first_attempt'] > AUTH_WINDOW_SECONDS:
-        _failed_auth[ip] = {
-            'count': 1,
-            'first_attempt': now,
-            'locked_until': 0,
-        }
-    else:
-        record['count'] += 1
-        if record['count'] >= MAX_AUTH_ATTEMPTS:
-            record['locked_until'] = now + LOCKOUT_SECONDS
-
-
-def _reset_auth_attempts(ip):
-    """Reset failed attempts after a successful auth."""
-    _failed_auth.pop(ip, None)
-
 
 # ─── Auth helpers ────────────────────────────────────────────────────────────
 
@@ -668,8 +618,6 @@ def app(environ, start_response):
     content_length = int(environ.get('CONTENT_LENGTH', 0))
     body = environ['wsgi.input'].read(content_length) if content_length else b''
 
-    ip = _get_client_ip(environ)
-
     # Helper to send JSON response
     def send_json(data, status=200, extra_headers=None):
         body_out = json.dumps(data, ensure_ascii=False).encode()
@@ -700,19 +648,8 @@ def app(environ, start_response):
         if method != 'POST':
             return send_json({'error': 'Method not allowed. Use POST.'}, 405)
 
-        if _is_rate_limited(ip):
-            retry_after = int(_failed_auth[ip]['locked_until'] - time.time())
-            return send_json(
-                {'error': 'Too many failed attempts. Try again later.'},
-                429,
-                [('Retry-After', str(retry_after))]
-            )
-
         if not check_admin_password(body):
-            _record_failed_auth(ip)
             return send_json({'error': 'Unauthorized.'}, 401)
-
-        _reset_auth_attempts(ip)
 
         global _current_token
         data = json.loads(body) if body else {}
@@ -721,22 +658,10 @@ def app(environ, start_response):
 
         return send_json({'token': get_current_token()})
 
-    # Rate limit check for token-protected routes
-    if _is_rate_limited(ip):
-        retry_after = int(_failed_auth[ip]['locked_until'] - time.time())
-        return send_json(
-            {'error': 'Too many failed attempts. Try again later.'},
-            429,
-            [('Retry-After', str(retry_after))]
-        )
-
     # Auth check
     is_valid, failure_type = check_auth(environ, qs)
     if not is_valid:
-        _record_failed_auth(ip)
         return send_json({'error': 'Unauthorized. Pass ?token=... or Authorization: Bearer ***'}, 401)
-
-    _reset_auth_attempts(ip)
 
     folder = qs.get('folder', ['INBOX'])[0]
     page = int(qs.get('page', ['1'])[0])
