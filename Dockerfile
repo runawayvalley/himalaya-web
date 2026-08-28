@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Download himalaya binary
 ARG HIMALAYA_VERSION=v2.1.0
-RUN curl -sSL "https://github.com/pimalaya/himalaya/releases/download/${HIMALAYA_VERSION}/himalaya-x86_64-linux.tar.gz" \
+RUN curl -sSL "https://github.com/pimalaya/himalaya/releases/download/${HIMALAYA_VERSION}/himalaya.x86_64-linux.tgz" \
     | tar -xz -C /usr/local/bin/ \
     && chmod +x /usr/local/bin/himalaya
 
