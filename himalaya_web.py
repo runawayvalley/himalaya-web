@@ -770,7 +770,7 @@ def main():
         print("\nShutting down.")
 
 
-def _make_stdlib_handler(self):
+def _make_stdlib_handler():
     """Create a BaseHTTPRequestHandler subclass that bridges to the WSGI app."""
     from http.server import BaseHTTPRequestHandler
     app_ref = app
