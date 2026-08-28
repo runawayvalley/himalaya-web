@@ -53,6 +53,15 @@ docker run -p 8877:8877 \
   himalaya-web
 ```
 
+The auto-generated token is printed at startup — check `docker logs <container>`.
+You can also retrieve it with your admin password:
+
+```bash
+curl -X POST "http://localhost:8877/api/token" \
+  -H "Content-Type: application/json" \
+  -d '{"password": "your-secret-password", "action": "view"}'
+```
+
 ### Docker Compose
 
 ```yaml
@@ -73,7 +82,7 @@ services:
 |---|---|
 | `HIMALAYA_TOKEN` | Initial token (auto-generated if not set) |
 | `HIMALAYA_ADMIN_PASSWORD` | Password to view/rotate token via `/api/token` and `/token` |
-| `HIMALAYA_CONFIG_BASE64` | Base64-encoded himalaya config (uses default config location if not set) |
+| `HIMALAYA_CONFIG_BASE64` | Base64-encoded himalaya config — decoded to a temp file and passed to himalaya via its `--config` flag (himalaya v2 ignores env vars for config lookup) |
 | `HIMALAYA_BIN` | Path to himalaya binary (default: `himalaya`) |
 | `HIMALAYA_ACCOUNT` | Default himalaya account to use |
 

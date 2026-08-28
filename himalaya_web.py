@@ -9,7 +9,9 @@ Usage:
 Environment variables:
     HIMALAYA_TOKEN — initial token (auto-generated if not set)
     HIMALAYA_ADMIN_PASSWORD — password to view/rotate token via /api/token
-    HIMALAYA_CONFIG_BASE64 — base64-encoded himalaya config (uses default config if not set)
+    HIMALAYA_CONFIG_BASE64 — base64-encoded himalaya config (decoded to a temp file
+                          and passed to himalaya via --config; himalaya v2 ignores
+                          env vars for config lookup. Uses default config if not set)
 
 Endpoints (all read-only):
     GET /                          — HTML inbox view (human/agent friendly)
@@ -46,6 +48,15 @@ ADMIN_PASSWORD = os.environ.get("HIMALAYA_ADMIN_PASSWORD", "")
 # Module-level token state — can be rotated at runtime
 _current_token = None
 
+# Token is ALSO persisted to a file so all gunicorn workers (separate
+# processes) see the same token, and rotation propagates to all of them.
+TOKEN_FILE = os.path.join(tempfile.gettempdir(), "himalaya_web_token")
+
+# Path to the decoded himalaya config file (set by init at import time)
+CONFIG_PATH = None
+
+_init_done = False
+
 # Rate limiting for auth failures
 _failed_auth = {}
 MAX_AUTH_ATTEMPTS = 5
@@ -54,7 +65,12 @@ LOCKOUT_SECONDS = 900  # 15 minutes
 
 
 def setup_config():
-    """Decode base64 config from env and write to temp file if provided."""
+    """Decode base64 config from env and write to temp file if provided.
+
+    Returns the path, or None. The path must be passed to himalaya via the
+    global `--config` flag — himalaya v2 does NOT read a HIMALAYA_CONFIG
+    environment variable.
+    """
     config_b64 = os.environ.get("HIMALAYA_CONFIG_BASE64")
     if config_b64:
         try:
@@ -65,11 +81,50 @@ def setup_config():
             )
             tmp.write(config_data)
             tmp.close()
-            os.environ["HIMALAYA_CONFIG"] = tmp.name
             return tmp.name
         except Exception as e:
             print(f"⚠️  Failed to decode HIMALAYA_CONFIG_BASE64: {e}")
     return None
+
+
+def init_app():
+    """Initialize config path and token.
+
+    Runs at module import time (not just in main()) because gunicorn imports
+    this module without ever calling main(). Idempotent.
+    """
+    global _current_token, CONFIG_PATH, _init_done
+    if _init_done:
+        return _current_token
+    _init_done = True
+
+    CONFIG_PATH = setup_config()
+    if CONFIG_PATH:
+        os.environ["HIMALAYA_CONFIG"] = CONFIG_PATH
+
+    # Token precedence: env var > shared file (other worker created it) > new
+    _current_token = os.environ.get("HIMALAYA_TOKEN")
+    if _current_token:
+        try:
+            _write_token_file(_current_token)
+        except OSError:
+            pass
+    else:
+        _current_token = get_current_token()
+        if _current_token is None:
+            _current_token = generate_token()
+            try:
+                _write_token_file(_current_token)
+            except OSError as e:
+                print(f"⚠️  Could not persist token file: {e}")
+
+    print("📧 Himalaya Web initialized.", flush=True)
+    if CONFIG_PATH:
+        print(f"   Config: decoded from HIMALAYA_CONFIG_BASE64 → {CONFIG_PATH}", flush=True)
+    else:
+        print("   Config: no HIMALAYA_CONFIG_BASE64 — himalaya will use its default config paths", flush=True)
+    print(f"   Token: {_current_token}  (view/rotate via POST /api/token)", flush=True)
+    return _current_token
 
 
 def generate_token():
@@ -77,9 +132,49 @@ def generate_token():
     return "tok_" + secrets.token_urlsafe(24)
 
 
+def _write_token_file(token):
+    """Atomically write the token file with owner-only permissions."""
+    fd = os.open(TOKEN_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, token.encode())
+    finally:
+        os.close(fd)
+    os.replace(TOKEN_FILE + ".tmp", TOKEN_FILE)
+
+
+def get_current_token():
+    """Return the live token, reading the shared file so all workers agree."""
+    try:
+        with open(TOKEN_FILE) as f:
+            token = f.read().strip()
+            if token:
+                return token
+    except OSError:
+        pass
+    return _current_token
+
+
+def set_current_token(token):
+    """Rotate the token in memory and in the shared file (all workers)."""
+    global _current_token
+    _current_token = token
+    try:
+        _write_token_file(token)
+    except OSError as e:
+        print(f"⚠️  Could not persist rotated token: {e}")
+
+
+# Initialize on import so gunicorn workers get config + token too
+init_app()
+
+
 def run_himalaya(*args, account=None):
     """Run a himalaya command and return stdout."""
     cmd = [HIMALAYA]
+    # himalaya v2 only reads config from --config flag or default paths;
+    # there is no HIMALAYA_CONFIG env var support.
+    if CONFIG_PATH:
+        cmd += ["--config", CONFIG_PATH]
     acct = account or DEFAULT_ACCOUNT
     if acct:
         cmd += ["--account", acct]
@@ -523,19 +618,23 @@ def check_auth(environ, qs):
     Check token auth using timing-safe comparison.
     Returns (is_valid, failure_type) where failure_type is 'token' or None.
     """
-    if not _current_token:
+    if not _current_token and not os.path.exists(TOKEN_FILE):
         return True, None  # no token configured = open access
+
+    live_token = get_current_token()
+    if not live_token:
+        return True, None
 
     # Check Authorization header
     auth = environ.get('HTTP_AUTHORIZATION', '')
     if auth.startswith('Bearer '):
         provided = auth[7:]
-        if secrets.compare_digest(provided, _current_token):
+        if secrets.compare_digest(provided, live_token):
             return True, None
 
     # Check query param
     token_param = qs.get('token', [None])[0]
-    if token_param is not None and secrets.compare_digest(token_param, _current_token):
+    if token_param is not None and secrets.compare_digest(token_param, live_token):
         return True, None
 
     return False, 'token'
@@ -618,9 +717,9 @@ def app(environ, start_response):
         global _current_token
         data = json.loads(body) if body else {}
         if data.get('action') == 'rotate':
-            _current_token = generate_token()
+            set_current_token(generate_token())
 
-        return send_json({'token': _current_token})
+        return send_json({'token': get_current_token()})
 
     # Rate limit check for token-protected routes
     if _is_rate_limited(ip):
@@ -644,11 +743,11 @@ def app(environ, start_response):
 
     if path == '/':
         q = qs.get('q', [''])[0]
-        tok = qs.get('token', [''])[0] or (_current_token or '')
+        tok = qs.get('token', [''])[0] or get_current_token()
         return send_html(html_inbox(folder, page, query=q, token=tok))
 
     elif path == '/api':
-        tok = qs.get('token', [''])[0] or (_current_token or '')
+        tok = qs.get('token', [''])[0] or get_current_token()
         return send_html(html_docs(token=tok))
 
     elif path == '/api/envelopes':
@@ -660,7 +759,7 @@ def app(environ, start_response):
 
     elif path.startswith('/api/message/'):
         msg_id = path.split('/')[-1]
-        tok = qs.get('token', [''])[0] or (_current_token or '')
+        tok = qs.get('token', [''])[0] or get_current_token()
         as_json = qs.get('format', [''])[0].lower() == 'json'
         body_only = qs.get('body', [''])[0] == '1'
         data, err = get_message(msg_id, folder=folder, as_json=as_json, body_only=body_only)
@@ -702,17 +801,14 @@ def main():
     parser.add_argument("--gunicorn", action="store_true", help="Use gunicorn instead of stdlib server")
     args = parser.parse_args()
 
-    # Setup config from base64 env if provided
-    config_path = setup_config()
-
-    global _current_token
-    _current_token = os.environ.get("HIMALAYA_TOKEN") or generate_token()
+    # Init is idempotent — config/token are already set at import time
+    init_app()
 
     bind_addr = f"{args.bind}:{args.port}"
     print(f"📧 Himalaya Web running on http://{bind_addr}")
     print(f"   Token auth enabled. URL: http://{bind_addr}/?token={_current_token}")
-    if config_path:
-        print(f"   Config: loaded from HIMALAYA_CONFIG_BASE64 ({config_path})")
+    if CONFIG_PATH:
+        print(f"   Config: loaded from HIMALAYA_CONFIG_BASE64 ({CONFIG_PATH})")
     if ADMIN_PASSWORD:
         print(f"   Token management: POST /api/token (JSON body)")
     else:
