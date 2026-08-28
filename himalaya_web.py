@@ -756,7 +756,7 @@ def main():
             def __call__(self, environ, start_response):
                 return self.app(environ, start_response)
 
-        server = HTTPServer((args.bind, args.port), self._make_stdlib_handler())
+        server = HTTPServer((args.bind, args.port), _make_stdlib_handler())
         try:
             server.serve_forever()
         except KeyboardInterrupt:
