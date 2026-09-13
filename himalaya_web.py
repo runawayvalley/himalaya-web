@@ -34,6 +34,7 @@ import base64
 import html
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -303,7 +304,7 @@ def html_inbox(folder="INBOX", page=1, query="", token=""):
             unread = "●" if "Seen" not in str(flags) else ""
             rows += f"""<tr>
   <td style="padding:4px 8px">{unread}</td>
-  <td style="padding:4px 8px"><a href="/api/message/{eid}?folder={html.escape(folder)}&token={html.escape(token)}" style="color:#58a6ff">{subj}</a></td>
+  <td style="padding:4px 8px"><a href="/message/{eid}?folder={html.escape(folder)}&token={html.escape(token)}" style="color:#58a6ff">{subj}</a></td>
   <td style="padding:4px 8px;color:#8b949e">{fr}</td>
   <td style="padding:4px 8px;color:#8b949e;font-size:0.85em">{date}</td>
 </tr>\n"""
@@ -359,10 +360,81 @@ def html_inbox(folder="INBOX", page=1, query="", token=""):
 </body></html>"""
 
 
+# Bare URLs (http/https) and bare www. hosts become clickable links.
+# Matched greedily so query strings and fragments stay inside the link;
+# trailing sentence punctuation and unbalanced closers are left outside.
+_URL_RE = re.compile(r"(?P<url>(?:https?://|www\.)[^\s<>\"']+)", re.IGNORECASE)
+
+
+# Matches a URL split across a line break by sender-side wrapping.
+_URL_SPLIT_RE = re.compile(
+    r"(?P<base>(?:https?://|www\.)[^\s<>\"']{10,}?)\r?\n\s*(?P<cont>[^\s<>\"']+)",
+    re.IGNORECASE,
+)
+# Continuation looks like more URL (has URL specials or is a long token chunk).
+_URL_CONT_OK = re.compile(r"[/?&=#%+~:]|[A-Za-z0-9\-_~.]{24,}")
+
+
+def _unfold_wrapped_urls(text):
+    """Join line breaks inserted inside long URLs so the link stays whole."""
+    for _ in range(5):
+        def _join(m):
+            base, cont = m.group("base"), m.group("cont")
+            # Quoted-printable soft break ("=" at EOL) is always a join.
+            if base.endswith("="):
+                return base[:-1] + cont
+            line_start = text.rfind("\n", 0, m.end("base")) + 1
+            if m.end("base") - line_start < 70:
+                return m.group(0)
+            if not _URL_CONT_OK.search(cont):
+                return m.group(0)
+            return base + cont
+
+        new = _URL_SPLIT_RE.sub(_join, text)
+        if new == text:
+            return text
+        text = new
+    return text
+
+
+def _linkify_text(text):
+    """Escape text to HTML, then wrap bare URLs in clickable <a> tags."""
+    text = _unfold_wrapped_urls(text)
+    parts = []
+    last = 0
+    for m in _URL_RE.finditer(text):
+        start, end = m.span("url")
+        url = m.group("url")
+        # Strip trailing sentence punctuation (.,;:!?) — almost never
+        # part of the URL when it appears at the very end.
+        trail = ""
+        while url and url[-1] in ".,;:!?":
+            trail = url[-1] + trail
+            url = url[:-1]
+        # Strip unbalanced closing brackets so "(see https://...)" and
+        # "[https://...]" link fully without swallowing the closer.
+        for opener, closer in (("(", ")"), ("[", "]"), ("{", "}")):
+            while url.endswith(closer) and url.count(closer) > url.count(opener):
+                trail = closer + trail
+                url = url[:-1]
+        if not url:
+            continue
+        parts.append(html.escape(text[last:start]))
+        href = url if re.match(r"(?i)^https?://", url) else "http://" + url
+        parts.append(
+            f'<a href="{html.escape(href, quote=True)}"'
+            f' target="_blank" rel="noopener noreferrer">{html.escape(url)}</a>'
+            f"{html.escape(trail)}"
+        )
+        last = end
+    parts.append(html.escape(text[last:]))
+    return "".join(parts)
+
+
 def html_message(msg_id, folder="INBOX", token=""):
     """Render a single message as clean HTML."""
     body, err = get_message(msg_id, folder)
-    content = html.escape(body or err or "No content")
+    content = _linkify_text(body) if body else html.escape(err or "No content")
     return f"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
@@ -370,8 +442,8 @@ def html_message(msg_id, folder="INBOX", token=""):
 <style>
   body {{ font-family: monospace; background: #0d1117; color: #c9d1d9;
          margin: 0; padding: 20px; max-width: 900px; }}
-  pre {{ white-space: pre-wrap; word-wrap: break-word; line-height: 1.5; }}
-  a {{ color: #58a6ff; }}
+  pre {{ white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; line-height: 1.5; }}
+  a {{ color: #58a6ff; overflow-wrap: anywhere; }}
   .back {{ margin-bottom: 16px; }}
 </style>
 </head><body>
@@ -682,16 +754,27 @@ def app(environ, start_response):
             return send_json({'error': err}, 500)
         return send_json(data)
 
-    elif path.startswith('/api/message/'):
-        msg_id = path.split('/')[-1]
+    elif path.startswith('/message/') or path.startswith('/api/message/'):
+        msg_id = path.rsplit('/', 1)[-1]
+        if not msg_id:
+            return send_json({'error': 'Not found'}, 404)
         tok = qs.get('token', [''])[0] or get_current_token()
         as_json = qs.get('format', [''])[0].lower() == 'json'
         body_only = qs.get('body', [''])[0] == '1'
+        wants_html = 'text/html' in (environ.get('HTTP_ACCEPT', '') or '').lower()
         data, err = get_message(msg_id, folder=folder, as_json=as_json, body_only=body_only)
         if err:
+            if wants_html and not as_json:
+                return send_html(
+                    f"<!DOCTYPE html><html><body><p>{html.escape(err)}</p></body></html>",
+                    500,
+                )
             return send_json({'error': err}, 500)
         if as_json:
             return send_json(json.loads(data))
+        # Browser navigation → clickable HTML; API clients → plain text.
+        if wants_html:
+            return send_html(html_message(msg_id, folder, tok))
         body_out = (data or '').encode()
         headers = [('Content-Type', 'text/plain; charset=utf-8'),
                    ('Content-Length', str(len(body_out)))]
