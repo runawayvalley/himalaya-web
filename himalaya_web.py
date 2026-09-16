@@ -253,6 +253,19 @@ def generate_token():
     return "tok_" + secrets.token_urlsafe(24)
 
 
+def _default_workers():
+    """Auto-size gunicorn workers: (2 * CPU) + 1, overridable via env."""
+    for var in ("GUNICORN_WORKERS", "WEB_CONCURRENCY"):
+        val = os.environ.get(var, "").strip()
+        if val.isdigit() and int(val) >= 1:
+            return int(val)
+    try:
+        cpu = os.cpu_count() or 1
+    except NotImplementedError:
+        cpu = 1
+    return 2 * cpu + 1
+
+
 def _write_token_file(token):
     """Atomically write the token file with owner-only permissions."""
     fd = os.open(TOKEN_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1229,7 +1242,7 @@ def main():
 
         options = {
             'bind': bind_addr,
-            'workers': 2,
+            'workers': _default_workers(),
             'timeout': 120,
         }
         GunicornApp(app, options).run()
