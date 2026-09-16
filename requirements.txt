@@ -1,0 +1,5 @@
+Flask>=2.3
+gunicorn>=21.2
+# Only needed when DATABASE_URL is set (Postgres-backed multi-token store),
+# but included by default for simplicity — it's a small binary wheel.
+psycopg2-binary>=2.9

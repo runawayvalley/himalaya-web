@@ -17,10 +17,10 @@ WORKDIR /app
 # Ensure Python print() output (startup banner with token) is visible in docker logs
 ENV PYTHONUNBUFFERED=1
 
-COPY himalaya_web.py .
+COPY requirements.txt himalaya_web.py .
 
-# Install gunicorn
-RUN pip install --no-cache-dir gunicorn
+# Install gunicorn + Flask + psycopg2 (psycopg2 only used when DATABASE_URL is set)
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Create non-root user
 RUN useradd --create-home appuser
@@ -32,4 +32,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
 
 # --preload: load the app once in the master so config + token are initialized
 # before forking workers (all workers share the same token file and config).
-ENTRYPOINT ["gunicorn", "himalaya_web:app", "--bind", "0.0.0.0:8877", "--workers", "2", "--preload"]
+# Workers auto-size to (2 * CPU) + 1, unless GUNICORN_WORKERS/WEB_CONCURRENCY is set.
+ENTRYPOINT ["sh", "-c", "exec gunicorn himalaya_web:app --bind 0.0.0.0:${PORT:-8877} --workers ${GUNICORN_WORKERS:-${WEB_CONCURRENCY:-$((2 * $(nproc 2>/dev/null || echo 1) + 1))}} --preload"]

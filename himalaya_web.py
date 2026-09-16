@@ -4,11 +4,20 @@ Himalaya Web — read-only email viewer for browser agents.
 
 Usage:
     gunicorn himalaya_web:app --bind 127.0.0.1:8877
-    python3 himalaya_web.py  (falls back to stdlib for local use)
+    python3 himalaya_web.py  (falls back to Flask's dev server for local use)
 
 Environment variables:
-    HIMALAYA_TOKEN — initial token (auto-generated if not set)
-    HIMALAYA_ADMIN_PASSWORD — password to view/rotate token via /api/token
+    HIMALAYA_TOKEN — initial token (auto-generated if not set; ignored when
+                          DATABASE_URL is set — Postgres becomes the source of truth)
+    HIMALAYA_ADMIN_PASSWORD — password to view/rotate/manage tokens via /api/token.
+                          Always read from the environment — the highest authority,
+                          regardless of which token backend is active.
+    DATABASE_URL — postgres connection string. When set, tokens are stored
+                          entirely in Postgres (table auto-created) as
+                          (label, token) pairs that can be added and revoked at
+                          runtime, and survive restarts/redeploys with a new
+                          server-generated token. When unset, behavior is
+                          unchanged: a single in-memory/file-backed token.
     HIMALAYA_CONFIG_BASE64 — base64-encoded himalaya config (decoded to a temp file
                           and passed to himalaya via --config; himalaya v2 ignores
                           env vars for config lookup. Uses default config if not set)
@@ -23,7 +32,8 @@ Endpoints (all read-only):
     GET /api/search?q=<query>&folder=X — JSON: search in folder
     GET /api/folders               — JSON: list folders
     GET /health                    — 200 OK (no auth needed)
-    POST /api/token                — view or rotate token (admin only, JSON body)
+    POST /api/token                — view/rotate (no DB) or list/add/revoke/rotate
+                                      (DATABASE_URL set) tokens, admin only, JSON body
     GET /token                     — token management webpage
 
 Auth: pass ?token=<TOKEN> query param, or Authorization: Bearer *** header.
@@ -37,25 +47,125 @@ import os
 import re
 import secrets
 import subprocess
-import sys
 import tempfile
-from urllib.parse import urlparse, parse_qs
+
+from flask import Flask, Response, jsonify, request
 
 HIMALAYA = os.environ.get("HIMALAYA_BIN", "himalaya")
 DEFAULT_ACCOUNT = os.environ.get("HIMALAYA_ACCOUNT", "")
+# Admin password is always the highest authority and always comes from the
+# environment, regardless of which token backend (file or Postgres) is active.
 ADMIN_PASSWORD = os.environ.get("HIMALAYA_ADMIN_PASSWORD", "")
 
-# Module-level token state — can be rotated at runtime
+# When set, tokens live entirely in Postgres (multiple labeled tokens,
+# addable/revocable at runtime, persistent across PaaS redeploys/restarts).
+# When unset, behavior is unchanged from the original single in-memory/file token.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USE_POSTGRES = bool(DATABASE_URL)
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
+
+# Module-level token state — can be rotated at runtime (file-backed mode only)
 _current_token = None
 
 # Token is ALSO persisted to a file so all gunicorn workers (separate
 # processes) see the same token, and rotation propagates to all of them.
+# Unused when USE_POSTGRES is True.
 TOKEN_FILE = os.path.join(tempfile.gettempdir(), "himalaya_web_token")
 
 # Path to the decoded himalaya config file (set by init at import time)
 CONFIG_PATH = None
 
 _init_done = False
+
+# ─── Postgres token store ───────────────────────────────────────────────────
+
+
+def _pg_connect():
+    if psycopg2 is None:
+        raise RuntimeError(
+            "DATABASE_URL is set but psycopg2 is not installed. "
+            "Install it with: pip install psycopg2-binary"
+        )
+    return psycopg2.connect(DATABASE_URL)
+
+
+def pg_init_schema():
+    """Create the tokens table if it doesn't exist yet."""
+    with _pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS himalaya_web_tokens (
+                    label TEXT PRIMARY KEY,
+                    token TEXT UNIQUE NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        conn.commit()
+
+
+def pg_list_tokens():
+    """Return all tokens as a list of dicts, ordered by creation time."""
+    with _pg_connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT label, token, created_at FROM himalaya_web_tokens "
+                "ORDER BY created_at ASC"
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "label": r["label"],
+            "token": r["token"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+def pg_add_token(label, token=None):
+    """Create or replace the token for a label (upsert). Returns the token."""
+    token = token or generate_token()
+    with _pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO himalaya_web_tokens (label, token)
+                VALUES (%s, %s)
+                ON CONFLICT (label) DO UPDATE SET token = EXCLUDED.token,
+                                                   created_at = now()
+                """,
+                (label, token),
+            )
+        conn.commit()
+    return token
+
+
+def pg_revoke_token(label):
+    """Delete the token for a label. Returns True if a row was removed."""
+    with _pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM himalaya_web_tokens WHERE label = %s", (label,))
+            deleted = cur.rowcount > 0
+        conn.commit()
+    return deleted
+
+
+def pg_is_valid_token(candidate):
+    """Timing-safe check of candidate against every stored token."""
+    if not candidate:
+        return False
+    valid = False
+    for row in pg_list_tokens():
+        if secrets.compare_digest(candidate, row["token"]):
+            valid = True
+    return valid
 
 # ─── Config loading ─────────────────────────────────────────────────────────
 
@@ -84,7 +194,7 @@ def setup_config():
 
 
 def init_app():
-    """Initialize config path and token.
+    """Initialize config path and token(s).
 
     Runs at module import time (not just in main()) because gunicorn imports
     this module without ever calling main(). Idempotent.
@@ -97,6 +207,26 @@ def init_app():
     CONFIG_PATH = setup_config()
     if CONFIG_PATH:
         os.environ["HIMALAYA_CONFIG"] = CONFIG_PATH
+
+    print("📧 Himalaya Web initialized.", flush=True)
+    if CONFIG_PATH:
+        print(f"   Config: decoded from HIMALAYA_CONFIG_BASE64 → {CONFIG_PATH}", flush=True)
+    else:
+        print("   Config: no HIMALAYA_CONFIG_BASE64 — himalaya will use its default config paths", flush=True)
+
+    if USE_POSTGRES:
+        # Postgres is the sole source of truth for tokens in this mode — no
+        # env-var/file token is used, so a PaaS token that changes on every
+        # deploy doesn't matter: tokens persist in the database instead.
+        pg_init_schema()
+        tokens = pg_list_tokens()
+        if not tokens:
+            default_token = pg_add_token("default")
+            print(f"   Tokens: Postgres store empty — created label 'default': {default_token}", flush=True)
+        else:
+            print(f"   Tokens: {len(tokens)} token(s) loaded from Postgres (manage via POST /api/token)", flush=True)
+        _current_token = None
+        return None
 
     # Token precedence: env var > shared file (other worker created it) > new
     _current_token = os.environ.get("HIMALAYA_TOKEN")
@@ -114,11 +244,6 @@ def init_app():
             except OSError as e:
                 print(f"⚠️  Could not persist token file: {e}")
 
-    print("📧 Himalaya Web initialized.", flush=True)
-    if CONFIG_PATH:
-        print(f"   Config: decoded from HIMALAYA_CONFIG_BASE64 → {CONFIG_PATH}", flush=True)
-    else:
-        print("   Config: no HIMALAYA_CONFIG_BASE64 — himalaya will use its default config paths", flush=True)
     print(f"   Token: {_current_token}  (view/rotate via POST /api/token)", flush=True)
     return _current_token
 
@@ -126,6 +251,19 @@ def init_app():
 def generate_token():
     """Generate a secure random token."""
     return "tok_" + secrets.token_urlsafe(24)
+
+
+def _default_workers():
+    """Auto-size gunicorn workers: (2 * CPU) + 1, overridable via env."""
+    for var in ("GUNICORN_WORKERS", "WEB_CONCURRENCY"):
+        val = os.environ.get(var, "").strip()
+        if val.isdigit() and int(val) >= 1:
+            return int(val)
+    try:
+        cpu = os.cpu_count() or 1
+    except NotImplementedError:
+        cpu = 1
+    return 2 * cpu + 1
 
 
 def _write_token_file(token):
@@ -139,7 +277,13 @@ def _write_token_file(token):
 
 
 def get_current_token():
-    """Return the live token, reading the shared file so all workers agree."""
+    """Return the live token, reading the shared file so all workers agree.
+
+    In Postgres mode there is no single "current" token (there can be many,
+    labeled); this returns "" so URL-building code has something to embed.
+    """
+    if USE_POSTGRES:
+        return ""
     try:
         with open(TOKEN_FILE) as f:
             token = f.read().strip()
@@ -519,7 +663,14 @@ GET /api/message/176?token={t}
 
 
 def html_token_page():
-    """Token management page — enter password to view/rotate token."""
+    """Token management page — enter password to view/rotate/manage tokens."""
+    if USE_POSTGRES:
+        return _html_token_page_postgres()
+    return _html_token_page_single()
+
+
+def _html_token_page_single():
+    """Single-token (file/env-backed) management page — original behavior."""
     return """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
@@ -631,15 +782,213 @@ document.getElementById('password').addEventListener('keydown', (e) => {
 </body></html>"""
 
 
+def _html_token_page_postgres():
+    """Multi-token (Postgres-backed) management page — list/add/revoke/rotate by label."""
+    return """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Himalaya Web — Token Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px;
+         display: flex; justify-content: center; min-height: 100vh; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+          padding: 32px; width: 100%; max-width: 560px; margin-top: 40px; }
+  h1 { margin: 0 0 8px; font-size: 1.3em; }
+  p { color: #8b949e; margin: 0 0 20px; font-size: 0.9em; }
+  label { display: block; margin-bottom: 6px; font-size: 0.85em; color: #8b949e; }
+  input[type=password], input[type=text] { width: 100%; padding: 10px 12px; margin-bottom: 16px;
+    background: #0d1117; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 6px; box-sizing: border-box; font-size: 1em; }
+  input:focus { outline: none; border-color: #58a6ff; }
+  .row { display: flex; gap: 8px; }
+  .row input[type=text] { flex: 1; }
+  button { padding: 10px 16px; border: none; border-radius: 6px;
+           font-size: 0.95em; cursor: pointer; font-weight: 500; white-space: nowrap; }
+  .btn-primary { background: #238636; color: #fff; }
+  .btn-primary:hover { background: #2ea043; }
+  .btn-danger { background: #da3633; color: #fff; }
+  .btn-danger:hover { background: #f85149; }
+  .btn-secondary { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+  .btn-secondary:hover { background: #30363d; }
+  .result { margin-top: 16px; padding: 12px; border-radius: 6px; font-size: 0.9em;
+            display: none; word-break: break-all; }
+  .result.success { display: block; background: #1b4332; border: 1px solid #2ea043; color: #56d364; }
+  .result.error { display: block; background: #3d1f1f; border: 1px solid #f85149; color: #f85149; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #21262d; font-size: 0.85em; }
+  th { color: #8b949e; font-weight: 500; }
+  td.token-cell { font-family: monospace; cursor: pointer; word-break: break-all; }
+  td.token-cell:hover { color: #58a6ff; }
+  .hint { font-size: 0.8em; color: #8b949e; margin-top: 4px; }
+  h2 { font-size: 1em; margin: 24px 0 8px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+</style>
+</head><body>
+<div class="card">
+  <h1>🔑 Token Management (Postgres)</h1>
+  <p>Enter admin password to list, add, revoke, or rotate labeled tokens.</p>
+
+  <label for="password">Admin Password</label>
+  <input type="password" id="password" placeholder="Enter admin password..." autofocus>
+
+  <div class="row">
+    <button class="btn-secondary" style="flex:1" onclick="listTokens()">Refresh List</button>
+  </div>
+
+  <h2>Add Token</h2>
+  <div class="row">
+    <input type="text" id="newLabel" placeholder="label (e.g. agent-1)">
+    <button class="btn-primary" onclick="addToken()">Add</button>
+  </div>
+
+  <div id="result" class="result"></div>
+
+  <h2>Tokens</h2>
+  <table id="tokenTable">
+    <thead><tr><th>Label</th><th>Token</th><th>Created</th><th></th><th></th></tr></thead>
+    <tbody id="tokenRows"><tr><td colspan="5" class="hint">Enter password and click "Refresh List".</td></tr></tbody>
+  </table>
+  <div class="hint">Click a token to copy it.</div>
+</div>
+
+<script>
+function pw() { return document.getElementById('password').value; }
+
+function showResult(ok, msg) {
+  const res = document.getElementById('result');
+  res.className = 'result ' + (ok ? 'success' : 'error');
+  res.textContent = msg;
+}
+
+function renderTokens(tokens) {
+  const rows = document.getElementById('tokenRows');
+  if (!tokens || !tokens.length) {
+    rows.innerHTML = '<tr><td colspan="5" class="hint">No tokens.</td></tr>';
+    return;
+  }
+  rows.innerHTML = tokens.map(t => `
+    <tr>
+      <td>${escapeHtml(t.label)}</td>
+      <td class="token-cell" onclick="copyText('${escapeAttr(t.token)}')" title="Click to copy">${escapeHtml(t.token)}</td>
+      <td>${escapeHtml(t.created_at || '')}</td>
+      <td><button class="btn-secondary" onclick="rotateToken('${escapeAttr(t.label)}')">Rotate</button></td>
+      <td><button class="btn-danger" onclick="revokeToken('${escapeAttr(t.label)}')">Revoke</button></td>
+    </tr>
+  `).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function escapeAttr(s) {
+  return String(s).replace(/'/g, "\\\\'");
+}
+
+async function callApi(payload) {
+  const r = await fetch('/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({ password: pw() }, payload))
+  });
+  const data = await r.json();
+  return { ok: r.ok, data };
+}
+
+async function listTokens() {
+  try {
+    const { ok, data } = await callApi({ action: 'list' });
+    if (ok) {
+      showResult(true, `${data.tokens.length} token(s) loaded.`);
+      renderTokens(data.tokens);
+    } else {
+      showResult(false, data.error || 'Failed to list tokens');
+    }
+  } catch (e) {
+    showResult(false, 'Request failed: ' + e.message);
+  }
+}
+
+async function addToken() {
+  const label = document.getElementById('newLabel').value.trim();
+  if (!label) { showResult(false, 'Enter a label first.'); return; }
+  try {
+    const { ok, data } = await callApi({ action: 'add', label });
+    if (ok) {
+      showResult(true, `Token added for '${label}'.`);
+      document.getElementById('newLabel').value = '';
+      renderTokens(data.tokens);
+    } else {
+      showResult(false, data.error || 'Failed to add token');
+    }
+  } catch (e) {
+    showResult(false, 'Request failed: ' + e.message);
+  }
+}
+
+async function revokeToken(label) {
+  if (!confirm(`Revoke token '${label}'? It will stop working immediately.`)) return;
+  try {
+    const { ok, data } = await callApi({ action: 'revoke', label });
+    if (ok) {
+      showResult(true, `Token '${label}' revoked.`);
+      renderTokens(data.tokens);
+    } else {
+      showResult(false, data.error || 'Failed to revoke token');
+    }
+  } catch (e) {
+    showResult(false, 'Request failed: ' + e.message);
+  }
+}
+
+async function rotateToken(label) {
+  if (!confirm(`Rotate token '${label}'? The old token will stop working immediately.`)) return;
+  try {
+    const { ok, data } = await callApi({ action: 'rotate', label });
+    if (ok) {
+      showResult(true, `Token '${label}' rotated.`);
+      renderTokens(data.tokens);
+    } else {
+      showResult(false, data.error || 'Failed to rotate token');
+    }
+  } catch (e) {
+    showResult(false, 'Request failed: ' + e.message);
+  }
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text);
+}
+
+document.getElementById('password').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') listTokens();
+});
+</script>
+</body></html>"""
+
+
 
 # ─── Auth helpers ────────────────────────────────────────────────────────────
 
 
-def check_auth(environ, qs):
+def check_auth():
     """
-    Check token auth using timing-safe comparison.
+    Check token auth using timing-safe comparison against the current request.
     Returns (is_valid, failure_type) where failure_type is 'token' or None.
     """
+    auth = request.headers.get('Authorization', '')
+    provided = auth[7:] if auth.startswith('Bearer ') else None
+    token_param = request.args.get('token')
+
+    if USE_POSTGRES:
+        # Postgres is the sole source of truth: any stored (non-revoked)
+        # label's token is accepted.
+        if provided and pg_is_valid_token(provided):
+            return True, None
+        if token_param is not None and pg_is_valid_token(token_param):
+            return True, None
+        return False, 'token'
+
     if not _current_token and not os.path.exists(TOKEN_FILE):
         return True, None  # no token configured = open access
 
@@ -647,15 +996,9 @@ def check_auth(environ, qs):
     if not live_token:
         return True, None
 
-    # Check Authorization header
-    auth = environ.get('HTTP_AUTHORIZATION', '')
-    if auth.startswith('Bearer '):
-        provided = auth[7:]
-        if secrets.compare_digest(provided, live_token):
-            return True, None
+    if provided and secrets.compare_digest(provided, live_token):
+        return True, None
 
-    # Check query param
-    token_param = qs.get('token', [None])[0]
     if token_param is not None and secrets.compare_digest(token_param, live_token):
         return True, None
 
@@ -679,124 +1022,176 @@ def check_admin_password(body):
         return False
 
 
-# ─── WSGI application ────────────────────────────────────────────────────────
+# ─── Flask application ───────────────────────────────────────────────────────
+
+app = Flask(__name__)
 
 
-def app(environ, start_response):
-    """WSGI application entry point for gunicorn."""
-    method = environ['REQUEST_METHOD']
-    path = environ['PATH_INFO'].rstrip('/') or '/'
-    qs = parse_qs(environ.get('QUERY_STRING', ''))
-    content_length = int(environ.get('CONTENT_LENGTH', 0))
-    body = environ['wsgi.input'].read(content_length) if content_length else b''
+def _html_response(content, status=200):
+    return Response(content, status=status, mimetype='text/html')
 
-    # Helper to send JSON response
-    def send_json(data, status=200, extra_headers=None):
-        body_out = json.dumps(data, ensure_ascii=False).encode()
-        headers = [('Content-Type', 'application/json; charset=utf-8'),
-                   ('Content-Length', str(len(body_out)))]
-        if extra_headers:
-            headers.extend(extra_headers)
-        start_response(f'{status} _', headers)
-        return [body_out]
 
-    def send_html(content, status=200):
-        body_out = content.encode()
-        headers = [('Content-Type', 'text/html; charset=utf-8'),
-                   ('Content-Length', str(len(body_out)))]
-        start_response(f'{status} _', headers)
-        return [body_out]
+@app.get('/health')
+def route_health():
+    # No auth needed
+    return jsonify({'status': 'ok'})
 
-    # Health check — no auth
-    if path == '/health':
-        return send_json({'status': 'ok'})
 
-    # Token management webpage — no auth needed (password entered in page)
-    if path == '/token':
-        return send_html(html_token_page())
+@app.get('/token')
+def route_token_page():
+    # No auth needed — password is entered in the page itself
+    return _html_response(html_token_page())
 
-    # Token management API — POST only, password in JSON body
-    if path == '/api/token':
-        if method != 'POST':
-            return send_json({'error': 'Method not allowed. Use POST.'}, 405)
 
-        if not check_admin_password(body):
-            return send_json({'error': 'Unauthorized.'}, 401)
+@app.post('/api/token')
+def route_api_token():
+    body = request.get_data()
+    if not check_admin_password(body):
+        return jsonify({'error': 'Unauthorized.'}), 401
 
-        global _current_token
-        data = json.loads(body) if body else {}
-        if data.get('action') == 'rotate':
-            set_current_token(generate_token())
+    data = json.loads(body) if body else {}
+    action = data.get('action', 'view')
 
-        return send_json({'token': get_current_token()})
+    if USE_POSTGRES:
+        label = (data.get('label') or '').strip()
+        if action == 'list':
+            return jsonify({'tokens': pg_list_tokens()})
+        if action == 'add':
+            if not label:
+                return jsonify({'error': "Missing 'label'."}), 400
+            token = pg_add_token(label)
+            return jsonify({'label': label, 'token': token, 'tokens': pg_list_tokens()})
+        if action == 'revoke':
+            if not label:
+                return jsonify({'error': "Missing 'label'."}), 400
+            removed = pg_revoke_token(label)
+            if not removed:
+                return jsonify({'error': f"No token labeled '{label}'."}), 404
+            return jsonify({'revoked': label, 'tokens': pg_list_tokens()})
+        if action == 'rotate':
+            if not label:
+                return jsonify({'error': "Missing 'label'."}), 400
+            if not any(r['label'] == label for r in pg_list_tokens()):
+                return jsonify({'error': f"No token labeled '{label}'."}), 404
+            token = pg_add_token(label)
+            return jsonify({'label': label, 'token': token, 'tokens': pg_list_tokens()})
+        # Default 'view' — list all tokens (there's no single "current" one)
+        return jsonify({'tokens': pg_list_tokens()})
 
-    # Auth check
-    is_valid, failure_type = check_auth(environ, qs)
+    # File/env-backed single-token mode (unchanged behavior)
+    if action == 'rotate':
+        set_current_token(generate_token())
+
+    return jsonify({'token': get_current_token()})
+
+
+def _require_auth():
+    """Return an error Response if auth fails, else None."""
+    is_valid, _failure_type = check_auth()
     if not is_valid:
-        return send_json({'error': 'Unauthorized. Pass ?token=... or Authorization: Bearer ***'}, 401)
+        return jsonify({'error': 'Unauthorized. Pass ?token=... or Authorization: Bearer ***'}), 401
+    return None
 
-    folder = qs.get('folder', ['INBOX'])[0]
-    page = int(qs.get('page', ['1'])[0])
 
-    if path == '/':
-        q = qs.get('q', [''])[0]
-        tok = qs.get('token', [''])[0] or get_current_token()
-        return send_html(html_inbox(folder, page, query=q, token=tok))
+@app.get('/')
+def route_inbox():
+    denied = _require_auth()
+    if denied:
+        return denied
+    folder = request.args.get('folder', 'INBOX')
+    page = int(request.args.get('page', '1'))
+    q = request.args.get('q', '')
+    tok = request.args.get('token', '') or get_current_token()
+    return _html_response(html_inbox(folder, page, query=q, token=tok))
 
-    elif path == '/api':
-        tok = qs.get('token', [''])[0] or get_current_token()
-        return send_html(html_docs(token=tok))
 
-    elif path == '/api/envelopes':
-        data, err = get_envelopes(folder=folder, page=page,
-                                   page_size=int(qs.get('page_size', ['20'])[0]))
-        if err:
-            return send_json({'error': err}, 500)
-        return send_json(data)
+@app.get('/api')
+def route_api_docs():
+    denied = _require_auth()
+    if denied:
+        return denied
+    tok = request.args.get('token', '') or get_current_token()
+    return _html_response(html_docs(token=tok))
 
-    elif path.startswith('/message/') or path.startswith('/api/message/'):
-        msg_id = path.rsplit('/', 1)[-1]
-        if not msg_id:
-            return send_json({'error': 'Not found'}, 404)
-        tok = qs.get('token', [''])[0] or get_current_token()
-        as_json = qs.get('format', [''])[0].lower() == 'json'
-        body_only = qs.get('body', [''])[0] == '1'
-        wants_html = 'text/html' in (environ.get('HTTP_ACCEPT', '') or '').lower()
-        data, err = get_message(msg_id, folder=folder, as_json=as_json, body_only=body_only)
-        if err:
-            if wants_html and not as_json:
-                return send_html(
-                    f"<!DOCTYPE html><html><body><p>{html.escape(err)}</p></body></html>",
-                    500,
-                )
-            return send_json({'error': err}, 500)
-        if as_json:
-            return send_json(json.loads(data))
-        # Browser navigation → clickable HTML; API clients → plain text.
-        if wants_html:
-            return send_html(html_message(msg_id, folder, tok))
-        body_out = (data or '').encode()
-        headers = [('Content-Type', 'text/plain; charset=utf-8'),
-                   ('Content-Length', str(len(body_out)))]
-        start_response('200 _', headers)
-        return [body_out]
 
-    elif path == '/api/search':
-        q = qs.get('q', [''])[0]
-        if not q:
-            return send_json({'error': 'Missing ?q= parameter'}, 400)
-        data, err = search_envelopes(q, folder=folder)
-        if err:
-            return send_json({'error': err}, 500)
-        return send_json(data)
+@app.get('/api/envelopes')
+def route_envelopes():
+    denied = _require_auth()
+    if denied:
+        return denied
+    folder = request.args.get('folder', 'INBOX')
+    page = int(request.args.get('page', '1'))
+    page_size = int(request.args.get('page_size', '20'))
+    data, err = get_envelopes(folder=folder, page=page, page_size=page_size)
+    if err:
+        return jsonify({'error': err}), 500
+    return jsonify(data)
 
-    elif path == '/api/folders':
-        data, err = get_folders()
-        if err:
-            return send_json({'error': err}, 500)
-        return send_json(data)
 
-    return send_json({'error': 'Not found'}, 404)
+def _message_route(msg_id):
+    denied = _require_auth()
+    if denied:
+        return denied
+    folder = request.args.get('folder', 'INBOX')
+    tok = request.args.get('token', '') or get_current_token()
+    as_json = request.args.get('format', '').lower() == 'json'
+    body_only = request.args.get('body', '') == '1'
+    wants_html = 'text/html' in (request.headers.get('Accept', '') or '').lower()
+    data, err = get_message(msg_id, folder=folder, as_json=as_json, body_only=body_only)
+    if err:
+        if wants_html and not as_json:
+            return _html_response(
+                f"<!DOCTYPE html><html><body><p>{html.escape(err)}</p></body></html>",
+                500,
+            )
+        return jsonify({'error': err}), 500
+    if as_json:
+        return jsonify(json.loads(data))
+    # Browser navigation → clickable HTML; API clients → plain text.
+    if wants_html:
+        return _html_response(html_message(msg_id, folder, tok))
+    return Response(data or '', mimetype='text/plain')
+
+
+@app.get('/message/<path:msg_id>')
+def route_message_legacy(msg_id):
+    return _message_route(msg_id)
+
+
+@app.get('/api/message/<path:msg_id>')
+def route_message(msg_id):
+    return _message_route(msg_id)
+
+
+@app.get('/api/search')
+def route_search():
+    denied = _require_auth()
+    if denied:
+        return denied
+    folder = request.args.get('folder', 'INBOX')
+    q = request.args.get('q', '')
+    if not q:
+        return jsonify({'error': 'Missing ?q= parameter'}), 400
+    data, err = search_envelopes(q, folder=folder)
+    if err:
+        return jsonify({'error': err}), 500
+    return jsonify(data)
+
+
+@app.get('/api/folders')
+def route_folders():
+    denied = _require_auth()
+    if denied:
+        return denied
+    data, err = get_folders()
+    if err:
+        return jsonify({'error': err}), 500
+    return jsonify(data)
+
+
+@app.errorhandler(404)
+def route_not_found(_e):
+    return jsonify({'error': 'Not found'}), 404
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
@@ -806,7 +1201,7 @@ def main():
     parser = argparse.ArgumentParser(description="Himalaya Web — read-only email viewer")
     parser.add_argument("--port", type=int, default=8877, help="Port to listen on")
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address (use 0.0.0.0 for external)")
-    parser.add_argument("--gunicorn", action="store_true", help="Use gunicorn instead of stdlib server")
+    parser.add_argument("--gunicorn", action="store_true", help="Use gunicorn instead of Flask's dev server")
     args = parser.parse_args()
 
     # Init is idempotent — config/token are already set at import time
@@ -814,7 +1209,10 @@ def main():
 
     bind_addr = f"{args.bind}:{args.port}"
     print(f"📧 Himalaya Web running on http://{bind_addr}")
-    print(f"   Token auth enabled. URL: http://{bind_addr}/?token={_current_token}")
+    if USE_POSTGRES:
+        print(f"   Tokens stored in Postgres — manage via POST /api/token (list/add/revoke/rotate)")
+    else:
+        print(f"   Token auth enabled. URL: http://{bind_addr}/?token={_current_token}")
     if CONFIG_PATH:
         print(f"   Config: loaded from HIMALAYA_CONFIG_BASE64 ({CONFIG_PATH})")
     if ADMIN_PASSWORD:
@@ -844,79 +1242,13 @@ def main():
 
         options = {
             'bind': bind_addr,
-            'workers': 2,
+            'workers': _default_workers(),
             'timeout': 120,
         }
         GunicornApp(app, options).run()
     else:
-        # Fallback to stdlib for local use
-        from http.server import HTTPServer
-
-        class WSGIHandler:
-            """Simple WSGI-to-Bridge for stdlib HTTPServer."""
-            def __init__(self, app):
-                self.app = app
-
-            def __call__(self, environ, start_response):
-                return self.app(environ, start_response)
-
-        server = HTTPServer((args.bind, args.port), _make_stdlib_handler())
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            print("\nShutting down.")
-            server.shutdown()
-
-    # This is unreachable but kept for clarity
-    try:
-        pass
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-
-
-def _make_stdlib_handler():
-    """Create a BaseHTTPRequestHandler subclass that bridges to the WSGI app."""
-    from http.server import BaseHTTPRequestHandler
-    app_ref = app
-
-    class WSGIBridgeHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self._handle()
-
-        def do_POST(self):
-            self._handle()
-
-        def _handle(self):
-            from io import BytesIO
-            environ = {
-                'REQUEST_METHOD': self.command,
-                'PATH_INFO': self.path.split('?')[0],
-                'QUERY_STRING': self.path.split('?', 1)[1] if '?' in self.path else '',
-                'CONTENT_TYPE': self.headers.get('Content-Type', ''),
-                'CONTENT_LENGTH': self.headers.get('Content-Length', '0'),
-                'HTTP_AUTHORIZATION': self.headers.get('Authorization', ''),
-                'HTTP_X_FORWARDED_FOR': self.headers.get('X-Forwarded-For', ''),
-                'REMOTE_ADDR': self.client_address[0],
-                'SERVER_NAME': self.server.server_name,
-                'SERVER_PORT': str(self.server.server_port),
-                'wsgi.input': BytesIO(self.rfile.read(int(self.headers.get('Content-Length', 0)))),
-                'wsgi.errors': sys.stderr,
-            }
-
-            def start_response(status, headers):
-                self.send_response(int(status.split(' ')[0]))
-                for h, v in headers:
-                    self.send_header(h, v)
-                self.end_headers()
-
-            result = app_ref(environ, start_response)
-            for chunk in result:
-                self.wfile.write(chunk)
-
-        def log_message(self, format, *args):
-            pass
-
-    return WSGIBridgeHandler
+        # Flask's built-in dev server — fine for local use, not for production
+        app.run(host=args.bind, port=args.port)
 
 
 if __name__ == "__main__":
