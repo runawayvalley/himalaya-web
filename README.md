@@ -79,8 +79,9 @@ services:
 
 | Variable | Description |
 |---|---|
-| `HIMALAYA_TOKEN` | Initial token (auto-generated if not set) |
-| `HIMALAYA_ADMIN_PASSWORD` | Password to view/rotate token via `/api/token` and `/token` |
+| `HIMALAYA_TOKEN` | Initial token (auto-generated if not set). Ignored when `DATABASE_URL` is set. |
+| `HIMALAYA_ADMIN_PASSWORD` | Password to view/rotate token via `/api/token` and `/token` — always read from env, the highest authority regardless of token backend |
+| `DATABASE_URL` | Postgres connection string. When set, tokens are stored entirely in Postgres as labeled, addable/revocable entries that persist across restarts/redeploys. When unset, behavior is unchanged (single in-memory/file token). |
 | `HIMALAYA_CONFIG_BASE64` | Base64-encoded himalaya config — decoded to a temp file and passed to himalaya via its `--config` flag (himalaya v2 ignores env vars for config lookup) |
 | `HIMALAYA_BIN` | Path to himalaya binary (default: `himalaya`) |
 | `HIMALAYA_ACCOUNT` | Default himalaya account to use |
@@ -88,6 +89,10 @@ services:
 ## Token management
 
 The token is auto-generated on startup using `secrets.token_urlsafe(24)` — always cryptographically random, no user input needed.
+
+By default the token lives in memory (shared across gunicorn workers via a temp file) and is lost when the process restarts. **If your host is a PaaS that redeploys/restarts the container regularly (e.g. rotates dynos or containers), set `DATABASE_URL` to switch to Postgres-backed token storage** — see below.
+
+### Single-token mode (default, no `DATABASE_URL`)
 
 ### Web UI
 
@@ -114,6 +119,44 @@ curl -X POST "http://localhost:8877/api/token" \
 ```
 
 This lets you revoke a token you gave to an AI agent — just rotate it and the old one stops working.
+
+### Multi-token mode (`DATABASE_URL` set)
+
+When `DATABASE_URL` (a Postgres connection string) is set, tokens are stored **entirely in Postgres** instead of memory/file. This is for PaaS deployments where the token would otherwise change on every restart or redeploy — Postgres becomes the durable source of truth, while `HIMALAYA_ADMIN_PASSWORD` remains the highest authority (always read from the environment, never stored in the DB).
+
+In this mode you manage any number of labeled tokens (e.g. one per agent/integration) — add and revoke them independently without affecting others:
+
+```bash
+export DATABASE_URL="postgresql://user:pass@host:5432/dbname"
+```
+
+The `himalaya_web_tokens` table (`label`, `token`, `created_at`) is created automatically on first run. If no tokens exist yet, a `default` label is created and printed to the logs.
+
+```bash
+# List all tokens
+curl -X POST "http://localhost:8877/api/token" \
+  -H "Content-Type: application/json" \
+  -d '{"password": "your-secret-password", "action": "list"}'
+
+# Add a new labeled token
+curl -X POST "http://localhost:8877/api/token" \
+  -H "Content-Type: application/json" \
+  -d '{"password": "your-secret-password", "action": "add", "label": "agent-1"}'
+
+# Revoke a token by label
+curl -X POST "http://localhost:8877/api/token" \
+  -H "Content-Type: application/json" \
+  -d '{"password": "your-secret-password", "action": "revoke", "label": "agent-1"}'
+
+# Rotate (regenerate) a labeled token, keeping the label
+curl -X POST "http://localhost:8877/api/token" \
+  -H "Content-Type: application/json" \
+  -d '{"password": "your-secret-password", "action": "rotate", "label": "agent-1"}'
+```
+
+Any request bearing a token that matches **any** stored, non-revoked label is authorized. The `/token` web UI adapts automatically to a label-based list/add/revoke/rotate view when `DATABASE_URL` is set.
+
+Requires the `psycopg2-binary` package (already included in the Docker image).
 
 ## Endpoints
 

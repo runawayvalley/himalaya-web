@@ -19,8 +19,8 @@ ENV PYTHONUNBUFFERED=1
 
 COPY himalaya_web.py .
 
-# Install gunicorn
-RUN pip install --no-cache-dir gunicorn
+# Install gunicorn + psycopg2 (only used when DATABASE_URL is set)
+RUN pip install --no-cache-dir gunicorn psycopg2-binary
 
 # Create non-root user
 RUN useradd --create-home appuser
