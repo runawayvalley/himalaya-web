@@ -4,7 +4,7 @@ Himalaya Web — read-only email viewer for browser agents.
 
 Usage:
     gunicorn himalaya_web:app --bind 127.0.0.1:8877
-    python3 himalaya_web.py  (falls back to stdlib for local use)
+    python3 himalaya_web.py  (falls back to Flask's dev server for local use)
 
 Environment variables:
     HIMALAYA_TOKEN — initial token (auto-generated if not set; ignored when
@@ -47,9 +47,9 @@ import os
 import re
 import secrets
 import subprocess
-import sys
 import tempfile
-from urllib.parse import urlparse, parse_qs
+
+from flask import Flask, Response, jsonify, request
 
 HIMALAYA = os.environ.get("HIMALAYA_BIN", "himalaya")
 DEFAULT_ACCOUNT = os.environ.get("HIMALAYA_ACCOUNT", "")
@@ -958,14 +958,14 @@ document.getElementById('password').addEventListener('keydown', (e) => {
 # ─── Auth helpers ────────────────────────────────────────────────────────────
 
 
-def check_auth(environ, qs):
+def check_auth():
     """
-    Check token auth using timing-safe comparison.
+    Check token auth using timing-safe comparison against the current request.
     Returns (is_valid, failure_type) where failure_type is 'token' or None.
     """
-    auth = environ.get('HTTP_AUTHORIZATION', '')
+    auth = request.headers.get('Authorization', '')
     provided = auth[7:] if auth.startswith('Bearer ') else None
-    token_param = qs.get('token', [None])[0]
+    token_param = request.args.get('token')
 
     if USE_POSTGRES:
         # Postgres is the sole source of truth: any stored (non-revoked)
@@ -1009,153 +1009,176 @@ def check_admin_password(body):
         return False
 
 
-# ─── WSGI application ────────────────────────────────────────────────────────
+# ─── Flask application ───────────────────────────────────────────────────────
+
+app = Flask(__name__)
 
 
-def app(environ, start_response):
-    """WSGI application entry point for gunicorn."""
-    method = environ['REQUEST_METHOD']
-    path = environ['PATH_INFO'].rstrip('/') or '/'
-    qs = parse_qs(environ.get('QUERY_STRING', ''))
-    content_length = int(environ.get('CONTENT_LENGTH', 0))
-    body = environ['wsgi.input'].read(content_length) if content_length else b''
+def _html_response(content, status=200):
+    return Response(content, status=status, mimetype='text/html')
 
-    # Helper to send JSON response
-    def send_json(data, status=200, extra_headers=None):
-        body_out = json.dumps(data, ensure_ascii=False).encode()
-        headers = [('Content-Type', 'application/json; charset=utf-8'),
-                   ('Content-Length', str(len(body_out)))]
-        if extra_headers:
-            headers.extend(extra_headers)
-        start_response(f'{status} _', headers)
-        return [body_out]
 
-    def send_html(content, status=200):
-        body_out = content.encode()
-        headers = [('Content-Type', 'text/html; charset=utf-8'),
-                   ('Content-Length', str(len(body_out)))]
-        start_response(f'{status} _', headers)
-        return [body_out]
+@app.get('/health')
+def route_health():
+    # No auth needed
+    return jsonify({'status': 'ok'})
 
-    # Health check — no auth
-    if path == '/health':
-        return send_json({'status': 'ok'})
 
-    # Token management webpage — no auth needed (password entered in page)
-    if path == '/token':
-        return send_html(html_token_page())
+@app.get('/token')
+def route_token_page():
+    # No auth needed — password is entered in the page itself
+    return _html_response(html_token_page())
 
-    # Token management API — POST only, password in JSON body
-    if path == '/api/token':
-        if method != 'POST':
-            return send_json({'error': 'Method not allowed. Use POST.'}, 405)
 
-        if not check_admin_password(body):
-            return send_json({'error': 'Unauthorized.'}, 401)
+@app.post('/api/token')
+def route_api_token():
+    body = request.get_data()
+    if not check_admin_password(body):
+        return jsonify({'error': 'Unauthorized.'}), 401
 
-        data = json.loads(body) if body else {}
-        action = data.get('action', 'view')
+    data = json.loads(body) if body else {}
+    action = data.get('action', 'view')
 
-        if USE_POSTGRES:
-            label = (data.get('label') or '').strip()
-            if action == 'list':
-                return send_json({'tokens': pg_list_tokens()})
-            if action == 'add':
-                if not label:
-                    return send_json({'error': "Missing 'label'."}, 400)
-                token = pg_add_token(label)
-                return send_json({'label': label, 'token': token, 'tokens': pg_list_tokens()})
-            if action == 'revoke':
-                if not label:
-                    return send_json({'error': "Missing 'label'."}, 400)
-                removed = pg_revoke_token(label)
-                if not removed:
-                    return send_json({'error': f"No token labeled '{label}'."}, 404)
-                return send_json({'revoked': label, 'tokens': pg_list_tokens()})
-            if action == 'rotate':
-                if not label:
-                    return send_json({'error': "Missing 'label'."}, 400)
-                if not any(r['label'] == label for r in pg_list_tokens()):
-                    return send_json({'error': f"No token labeled '{label}'."}, 404)
-                token = pg_add_token(label)
-                return send_json({'label': label, 'token': token, 'tokens': pg_list_tokens()})
-            # Default 'view' — list all tokens (there's no single "current" one)
-            return send_json({'tokens': pg_list_tokens()})
-
-        # File/env-backed single-token mode (unchanged behavior)
-        global _current_token
+    if USE_POSTGRES:
+        label = (data.get('label') or '').strip()
+        if action == 'list':
+            return jsonify({'tokens': pg_list_tokens()})
+        if action == 'add':
+            if not label:
+                return jsonify({'error': "Missing 'label'."}), 400
+            token = pg_add_token(label)
+            return jsonify({'label': label, 'token': token, 'tokens': pg_list_tokens()})
+        if action == 'revoke':
+            if not label:
+                return jsonify({'error': "Missing 'label'."}), 400
+            removed = pg_revoke_token(label)
+            if not removed:
+                return jsonify({'error': f"No token labeled '{label}'."}), 404
+            return jsonify({'revoked': label, 'tokens': pg_list_tokens()})
         if action == 'rotate':
-            set_current_token(generate_token())
+            if not label:
+                return jsonify({'error': "Missing 'label'."}), 400
+            if not any(r['label'] == label for r in pg_list_tokens()):
+                return jsonify({'error': f"No token labeled '{label}'."}), 404
+            token = pg_add_token(label)
+            return jsonify({'label': label, 'token': token, 'tokens': pg_list_tokens()})
+        # Default 'view' — list all tokens (there's no single "current" one)
+        return jsonify({'tokens': pg_list_tokens()})
 
-        return send_json({'token': get_current_token()})
+    # File/env-backed single-token mode (unchanged behavior)
+    if action == 'rotate':
+        set_current_token(generate_token())
 
-    # Auth check
-    is_valid, failure_type = check_auth(environ, qs)
+    return jsonify({'token': get_current_token()})
+
+
+def _require_auth():
+    """Return an error Response if auth fails, else None."""
+    is_valid, _failure_type = check_auth()
     if not is_valid:
-        return send_json({'error': 'Unauthorized. Pass ?token=... or Authorization: Bearer ***'}, 401)
+        return jsonify({'error': 'Unauthorized. Pass ?token=... or Authorization: Bearer ***'}), 401
+    return None
 
-    folder = qs.get('folder', ['INBOX'])[0]
-    page = int(qs.get('page', ['1'])[0])
 
-    if path == '/':
-        q = qs.get('q', [''])[0]
-        tok = qs.get('token', [''])[0] or get_current_token()
-        return send_html(html_inbox(folder, page, query=q, token=tok))
+@app.get('/')
+def route_inbox():
+    denied = _require_auth()
+    if denied:
+        return denied
+    folder = request.args.get('folder', 'INBOX')
+    page = int(request.args.get('page', '1'))
+    q = request.args.get('q', '')
+    tok = request.args.get('token', '') or get_current_token()
+    return _html_response(html_inbox(folder, page, query=q, token=tok))
 
-    elif path == '/api':
-        tok = qs.get('token', [''])[0] or get_current_token()
-        return send_html(html_docs(token=tok))
 
-    elif path == '/api/envelopes':
-        data, err = get_envelopes(folder=folder, page=page,
-                                   page_size=int(qs.get('page_size', ['20'])[0]))
-        if err:
-            return send_json({'error': err}, 500)
-        return send_json(data)
+@app.get('/api')
+def route_api_docs():
+    denied = _require_auth()
+    if denied:
+        return denied
+    tok = request.args.get('token', '') or get_current_token()
+    return _html_response(html_docs(token=tok))
 
-    elif path.startswith('/message/') or path.startswith('/api/message/'):
-        msg_id = path.rsplit('/', 1)[-1]
-        if not msg_id:
-            return send_json({'error': 'Not found'}, 404)
-        tok = qs.get('token', [''])[0] or get_current_token()
-        as_json = qs.get('format', [''])[0].lower() == 'json'
-        body_only = qs.get('body', [''])[0] == '1'
-        wants_html = 'text/html' in (environ.get('HTTP_ACCEPT', '') or '').lower()
-        data, err = get_message(msg_id, folder=folder, as_json=as_json, body_only=body_only)
-        if err:
-            if wants_html and not as_json:
-                return send_html(
-                    f"<!DOCTYPE html><html><body><p>{html.escape(err)}</p></body></html>",
-                    500,
-                )
-            return send_json({'error': err}, 500)
-        if as_json:
-            return send_json(json.loads(data))
-        # Browser navigation → clickable HTML; API clients → plain text.
-        if wants_html:
-            return send_html(html_message(msg_id, folder, tok))
-        body_out = (data or '').encode()
-        headers = [('Content-Type', 'text/plain; charset=utf-8'),
-                   ('Content-Length', str(len(body_out)))]
-        start_response('200 _', headers)
-        return [body_out]
 
-    elif path == '/api/search':
-        q = qs.get('q', [''])[0]
-        if not q:
-            return send_json({'error': 'Missing ?q= parameter'}, 400)
-        data, err = search_envelopes(q, folder=folder)
-        if err:
-            return send_json({'error': err}, 500)
-        return send_json(data)
+@app.get('/api/envelopes')
+def route_envelopes():
+    denied = _require_auth()
+    if denied:
+        return denied
+    folder = request.args.get('folder', 'INBOX')
+    page = int(request.args.get('page', '1'))
+    page_size = int(request.args.get('page_size', '20'))
+    data, err = get_envelopes(folder=folder, page=page, page_size=page_size)
+    if err:
+        return jsonify({'error': err}), 500
+    return jsonify(data)
 
-    elif path == '/api/folders':
-        data, err = get_folders()
-        if err:
-            return send_json({'error': err}, 500)
-        return send_json(data)
 
-    return send_json({'error': 'Not found'}, 404)
+def _message_route(msg_id):
+    denied = _require_auth()
+    if denied:
+        return denied
+    folder = request.args.get('folder', 'INBOX')
+    tok = request.args.get('token', '') or get_current_token()
+    as_json = request.args.get('format', '').lower() == 'json'
+    body_only = request.args.get('body', '') == '1'
+    wants_html = 'text/html' in (request.headers.get('Accept', '') or '').lower()
+    data, err = get_message(msg_id, folder=folder, as_json=as_json, body_only=body_only)
+    if err:
+        if wants_html and not as_json:
+            return _html_response(
+                f"<!DOCTYPE html><html><body><p>{html.escape(err)}</p></body></html>",
+                500,
+            )
+        return jsonify({'error': err}), 500
+    if as_json:
+        return jsonify(json.loads(data))
+    # Browser navigation → clickable HTML; API clients → plain text.
+    if wants_html:
+        return _html_response(html_message(msg_id, folder, tok))
+    return Response(data or '', mimetype='text/plain')
+
+
+@app.get('/message/<path:msg_id>')
+def route_message_legacy(msg_id):
+    return _message_route(msg_id)
+
+
+@app.get('/api/message/<path:msg_id>')
+def route_message(msg_id):
+    return _message_route(msg_id)
+
+
+@app.get('/api/search')
+def route_search():
+    denied = _require_auth()
+    if denied:
+        return denied
+    folder = request.args.get('folder', 'INBOX')
+    q = request.args.get('q', '')
+    if not q:
+        return jsonify({'error': 'Missing ?q= parameter'}), 400
+    data, err = search_envelopes(q, folder=folder)
+    if err:
+        return jsonify({'error': err}), 500
+    return jsonify(data)
+
+
+@app.get('/api/folders')
+def route_folders():
+    denied = _require_auth()
+    if denied:
+        return denied
+    data, err = get_folders()
+    if err:
+        return jsonify({'error': err}), 500
+    return jsonify(data)
+
+
+@app.errorhandler(404)
+def route_not_found(_e):
+    return jsonify({'error': 'Not found'}), 404
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
@@ -1165,7 +1188,7 @@ def main():
     parser = argparse.ArgumentParser(description="Himalaya Web — read-only email viewer")
     parser.add_argument("--port", type=int, default=8877, help="Port to listen on")
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address (use 0.0.0.0 for external)")
-    parser.add_argument("--gunicorn", action="store_true", help="Use gunicorn instead of stdlib server")
+    parser.add_argument("--gunicorn", action="store_true", help="Use gunicorn instead of Flask's dev server")
     args = parser.parse_args()
 
     # Init is idempotent — config/token are already set at import time
@@ -1211,74 +1234,8 @@ def main():
         }
         GunicornApp(app, options).run()
     else:
-        # Fallback to stdlib for local use
-        from http.server import HTTPServer
-
-        class WSGIHandler:
-            """Simple WSGI-to-Bridge for stdlib HTTPServer."""
-            def __init__(self, app):
-                self.app = app
-
-            def __call__(self, environ, start_response):
-                return self.app(environ, start_response)
-
-        server = HTTPServer((args.bind, args.port), _make_stdlib_handler())
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            print("\nShutting down.")
-            server.shutdown()
-
-    # This is unreachable but kept for clarity
-    try:
-        pass
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-
-
-def _make_stdlib_handler():
-    """Create a BaseHTTPRequestHandler subclass that bridges to the WSGI app."""
-    from http.server import BaseHTTPRequestHandler
-    app_ref = app
-
-    class WSGIBridgeHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self._handle()
-
-        def do_POST(self):
-            self._handle()
-
-        def _handle(self):
-            from io import BytesIO
-            environ = {
-                'REQUEST_METHOD': self.command,
-                'PATH_INFO': self.path.split('?')[0],
-                'QUERY_STRING': self.path.split('?', 1)[1] if '?' in self.path else '',
-                'CONTENT_TYPE': self.headers.get('Content-Type', ''),
-                'CONTENT_LENGTH': self.headers.get('Content-Length', '0'),
-                'HTTP_AUTHORIZATION': self.headers.get('Authorization', ''),
-                'HTTP_X_FORWARDED_FOR': self.headers.get('X-Forwarded-For', ''),
-                'REMOTE_ADDR': self.client_address[0],
-                'SERVER_NAME': self.server.server_name,
-                'SERVER_PORT': str(self.server.server_port),
-                'wsgi.input': BytesIO(self.rfile.read(int(self.headers.get('Content-Length', 0)))),
-                'wsgi.errors': sys.stderr,
-            }
-
-            def start_response(status, headers):
-                self.send_response(int(status.split(' ')[0]))
-                for h, v in headers:
-                    self.send_header(h, v)
-                self.end_headers()
-
-            result = app_ref(environ, start_response)
-            for chunk in result:
-                self.wfile.write(chunk)
-
-        def log_message(self, format, *args):
-            pass
-
-    return WSGIBridgeHandler
+        # Flask's built-in dev server — fine for local use, not for production
+        app.run(host=args.bind, port=args.port)
 
 
 if __name__ == "__main__":

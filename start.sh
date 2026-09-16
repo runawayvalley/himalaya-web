@@ -15,7 +15,7 @@ if command -v gunicorn &>/dev/null; then
   echo "📧 Starting himalaya-web on :$PORT with gunicorn..."
   gunicorn himalaya_web:app --bind "0.0.0.0:$PORT" --workers 2
 else
-  echo "📧 Starting himalaya-web on :$PORT with stdlib server..."
+  echo "📧 Starting himalaya-web on :$PORT with Flask's dev server..."
   echo "   (Install gunicorn for production use: pip install gunicorn)"
   python3 "$SCRIPT_DIR/himalaya_web.py" --port "$PORT"
 fi

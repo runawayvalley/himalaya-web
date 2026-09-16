@@ -14,7 +14,7 @@ A lightweight, read-only web interface for [himalaya](https://github.com/pimalay
 - **Search** — bare keywords search across subject/from/to/body; structured queries supported (`to X`, `from X`, `subject X and body Y`)
 - **Clean message view** — `?body=1` strips headers for easy parsing
 - **JSON opt-in** — `?format=json` for structured message output
-- **Zero dependencies** — Python stdlib only (gunicorn optional for production)
+- **Zero external state** — Flask app, gunicorn recommended for production (Flask's dev server works for local use)
 - **Docker support** — Dockerfile included for PaaS/self-hosting
 
 ## Quick start
@@ -23,11 +23,13 @@ A lightweight, read-only web interface for [himalaya](https://github.com/pimalay
 # Set admin password (enables token management)
 export HIMALAYA_ADMIN_PASSWORD="your-secret-password"
 
+# Install dependencies
+pip install -r requirements.txt
+
 # Run with gunicorn (recommended for production)
-pip install gunicorn
 gunicorn himalaya_web:app --bind 127.0.0.1:8877
 
-# Or run with stdlib server (local use only)
+# Or run with Flask's dev server (local use only)
 python3 himalaya_web.py --port 8877
 
 # Or use the start script
@@ -197,7 +199,9 @@ Bare keywords search all fields automatically. For targeted queries:
 
 - Python 3.8+
 - [himalaya](https://github.com/pimalaya/himalaya) CLI configured with an email account
-- gunicorn (optional, for production deployment)
+- Flask (required — see `requirements.txt`)
+- gunicorn (recommended for production deployment)
+- psycopg2-binary (only required when `DATABASE_URL` is set)
 
 ## Filter by recipient (catch-all / forwarded mailboxes)
 

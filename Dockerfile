@@ -17,10 +17,10 @@ WORKDIR /app
 # Ensure Python print() output (startup banner with token) is visible in docker logs
 ENV PYTHONUNBUFFERED=1
 
-COPY himalaya_web.py .
+COPY requirements.txt himalaya_web.py .
 
-# Install gunicorn + psycopg2 (only used when DATABASE_URL is set)
-RUN pip install --no-cache-dir gunicorn psycopg2-binary
+# Install gunicorn + Flask + psycopg2 (psycopg2 only used when DATABASE_URL is set)
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Create non-root user
 RUN useradd --create-home appuser
