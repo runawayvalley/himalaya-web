@@ -486,6 +486,7 @@ def html_inbox(folder="INBOX", page=1, query="", token=""):
     <input type="hidden" name="token" value="{html.escape(token)}">
     <button type="submit" style="background:#238636;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer">Search</button>
   </form>
+  <a href="/?folder={html.escape(folder)}&token={html.escape(token)}" title="Refresh — fetch latest emails" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:6px 14px;border-radius:6px;cursor:pointer;text-decoration:none">⟳ Refresh</a>
 </div>
 <table>
 <thead><tr>
